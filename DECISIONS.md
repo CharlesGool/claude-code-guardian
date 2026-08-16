@@ -8,6 +8,39 @@ already-rejected option gets recommended again two weeks later.
 
 ---
 
+## 2026-08-16 — open-sourced under GPL-3.0
+
+- **Context:** user asked to open-source the project under GPL-3.0.
+- **Decision:** added `LICENSE` (unmodified GPL-3.0 text, fetched via
+  `gh api /licenses/gpl-3.0` rather than reproduced from memory), a short
+  GPL notice header in `bin/claude-guardian.sh`, and updated the License
+  sections of README.md/README.zh.md. Provenance check (B-tier, required
+  before going public per the project-management skill): this repo vendors
+  no third-party code — `bin/claude-guardian.sh` is original, and the tool
+  only shells out to `tmux`/`systemctl`/`apt-get`/`claude` as external
+  programs, which does not create a licensing obligation. No
+  `THIRD_PARTY_NOTICES.md` needed. Also ran a full-history sensitive-info
+  sweep (all commits, not just current tree) before flipping visibility —
+  clean, no secrets/credentials/IPs, no files ever added-then-removed.
+- **Also fixed while preparing to go public:** DESIGN.md, DESIGN.zh.md, and
+  a DECISIONS.md entry had hardcoded the maintainer's internal NAS storage
+  path (`/root/MyGithub_Project`) — that path is an operational convention
+  of the maintainer's project-management workflow, not something that
+  should ever be baked into a project's own README/DESIGN. Generalized the
+  CIFS/chmod gotcha to describe the underlying filesystem behavior without
+  naming the specific path, and did the same in STATUS.md's template
+  comment.
+- **Rejected:** nothing — no viable alternative to a license/provenance
+  review before a first public release; this is a mandatory step, not a
+  choice between options.
+- **Consequences:** repository visibility flipped from private to public
+  (see STATUS.md for the current URL). GitHub's public visibility is
+  irreversible in the sense that anyone who cloned or cached the repo
+  during the time it was public retains that copy even if visibility is
+  later reverted to private.
+
+---
+
 ## 2026-08-16 — project renamed claude-code-watchdog → claude-code-guardian
 
 - **Context:** the project was scaffolded under the name `claude-code-watchdog`
@@ -18,10 +51,8 @@ already-rejected option gets recommended again two weeks later.
   and asked for one consistent name across code and project.
 - **Decision:** standardize on `claude-code-guardian`. Renamed the GitHub
   repo (`gh repo rename`, which auto-updated the local `origin` remote) and
-  the local project folder
-  (`/root/MyGithub_Project/claude-code-watchdog` → `.../claude-code-guardian`),
-  and fixed the title/URL references inside README.md, DESIGN.md, and
-  STATUS.md.
+  the maintainer's local project folder to match, and fixed the title/URL
+  references inside README.md, DESIGN.md, and STATUS.md.
 - **Rejected:** renaming the code side (CLI command, systemd unit name,
   `/etc/claude-guardian`, `/run/claude-guardian` socket) to `watchdog`
   instead — all of those were already live and deployed on the production

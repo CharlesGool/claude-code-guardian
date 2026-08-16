@@ -233,14 +233,15 @@ sufficient, without needing the rest of the repo.
   requirement that a deliberate kill must never leave zero live instances.
   Regardless of how many Ctrl+C it takes to exit, it is not a clean way to
   step away from the session — always use the tmux prefix + `d`.
-- **The repo, when checked out on the maintenance NAS mount at
-  `/root/MyGithub_Project`, lives on a CIFS filesystem mounted with a fixed
-  `file_mode=0644`** — `chmod +x` on `bin/claude-guardian.sh` is a silent
-  no-op there (exit code 0, permission bits unchanged). The executable bit
-  is instead recorded directly in the git tree with `git update-index
-  --chmod=+x bin/claude-guardian.sh` at commit time, so a normal `git
-  clone` onto any other filesystem checks it out executable. When working
-  directly inside this NAS-mounted copy, invoke the script explicitly with
+- **If your working copy of this repo lives on a CIFS/SMB-mounted
+  filesystem with a fixed `file_mode` option (common for NAS-backed dev
+  setups), `chmod +x` on `bin/claude-guardian.sh` can be a silent no-op**
+  (exit code 0, permission bits unchanged — this was hit during
+  development). The executable bit is recorded directly in the git tree
+  with `git update-index --chmod=+x bin/claude-guardian.sh` at commit time,
+  so a normal `git clone` onto a filesystem that supports real permission
+  bits checks it out executable regardless. If your local working copy
+  can't hold the exec bit, invoke the script explicitly with
   `bash bin/claude-guardian.sh ...` rather than `./bin/claude-guardian.sh`.
 - **Login is never enforced.** If `claude` has no valid credentials, the
   session still starts; `claude` itself will show its normal interactive

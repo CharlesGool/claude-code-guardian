@@ -13,7 +13,7 @@
 Keep this file short. Current state only — history belongs in CHANGELOG.md and git log.
 For public repositories, never write a Notion URL, a local/NAS absolute path, an
 internal hostname, or any other maintenance-only identifier here. Those live in
-/root/MyGithub_Project/<project>/.local-notes.md — outside repo/, so they are
+the maintainer's local .local-notes.md file outside this repo, so they are
 never committed and never end up in a snapshot.
 
 Update on events, not "before the session ends" (a session never announces its end):

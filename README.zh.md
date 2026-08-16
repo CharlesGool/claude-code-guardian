@@ -83,4 +83,4 @@ claude-guardian uninstall  # 移除 systemd 服务（配置和会话都不受影
 
 ## 许可证
 
-私有项目。保留所有权利——未授予任何复用、修改或再分发许可。
+[GPL-3.0](LICENSE)。本仓库未内嵌任何第三方代码。

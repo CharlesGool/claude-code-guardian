@@ -81,4 +81,4 @@ Gotcha: inside an attached session, Ctrl+C is interpreted by `claude` itself (in
 
 ## License
 
-Private project. All rights reserved — no license granted for reuse, modification, or redistribution.
+[GPL-3.0](LICENSE). No third-party code is vendored in this repository.
