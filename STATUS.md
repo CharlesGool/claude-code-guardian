@@ -2,7 +2,7 @@
 
 **Version:** unreleased · **Branch:** main
 **Notion:** not yet synced
-**Repo:** https://github.com/CharlesGool/claude-code-guardian (private)
+**Repo:** https://github.com/CharlesGool/claude-code-guardian (public, GPL-3.0)
 **Snapshots:** none yet
 **In progress:** implementation complete and installed live on this host (`systemctl is-active claude-guardian` → active), now launching `claude --permission-mode auto --remote-control` by default with an unattended-only keepalive (auto-Enter + `/remote-control` refresh) so the session stays remotely controllable through long idle stretches. Real end-to-end verification against the actual `claude` binary found and fixed three bugs: (1) `StartLimitIntervalSec` in the wrong unit section; (2) default `KillMode=control-group` killing the whole tmux session on `stop`/`restart`, fixed with `KillMode=process`; (3) the new unattended timers starting from epoch 0 instead of loop-start time, causing an immediate spurious nudge/refresh on every restart of an already-unattended session. The auto-Enter mechanism was flagged live by Claude Code's own auto-mode classifier as defeating the human-in-the-loop fallback; user was shown the tradeoff explicitly and confirmed proceeding (see DECISIONS.md 2026-08-16).
 **Next:** cut v0.1.0 — bump CHANGELOG, tag, push, export snapshot, sync Notion. (README.zh.md/DESIGN.zh.md are already fully translated as of this commit, ahead of the usual tag-time-only cadence, per explicit user request — they'll still get the normal full retranslation at v0.1.0 to pick up anything that changes before then.)
