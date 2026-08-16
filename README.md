@@ -6,11 +6,12 @@ Keeps at least one remotely-attachable Claude Code (`claude`) session alive on a
 
 ## What it does
 
-- Installs a systemd service that supervises a dedicated `tmux` session running `claude`.
+- Installs a systemd service that supervises a dedicated `tmux` session running `claude --permission-mode auto --remote-control` by default — remote control means you can take the session over from **claude.ai on the web or your phone**, not just SSH+tmux (the CLI prints a `claude.ai/code/...` URL on start; `claude-guardian logs` shows it).
 - If `claude` exits for any reason, it is respawned automatically within a few seconds — the tmux session (and its scrollback) survives.
 - If the whole supervisor or the host reboots, systemd brings it back automatically.
+- While nobody is attached, periodically nudges the session so it can't go silently stuck or unreachable: sends Enter to clear any confirmation `auto` permission mode fell back to after repeated classifier blocks, and proactively re-runs `/remote-control` well before Anthropic's ~30-minute "unreachable" threshold. See `DESIGN.md` → Known limitations for the safety tradeoff this involves.
 - Runs preflight checks before starting: auto-installs missing `apt` packages (`tmux` by default), verifies `claude` is on `PATH`, and warns (without blocking) if no login credentials are detected.
-- Ships an `attach` command for remote operators to take over the live session over SSH.
+- Ships an `attach` command for remote operators to take over the live session over SSH, as an alternative to the claude.ai remote-control URL.
 
 Non-goals: it does not install or update the Claude Code CLI itself, and it does not manage multiple concurrent named sessions (see `DESIGN.md`).
 
@@ -56,9 +57,13 @@ claude-guardian attach
 | `TMUX_SOCKET` | dedicated tmux server socket path | `/run/claude-guardian/tmux.sock` | no |
 | `WORKDIR` | working directory `claude` starts in | `/root` | no |
 | `CLAUDE_BIN` | `claude` executable name or absolute path | `claude` | no |
-| `CLAUDE_ARGS` | extra CLI args passed on every (re)start | *(empty)* | no |
+| `CLAUDE_ARGS` | extra CLI args passed on every (re)start | `--permission-mode auto --remote-control` | no |
 | `CHECK_INTERVAL_SEC` | seconds between liveness checks | `5` | no |
 | `REQUIRED_APT_PKGS` | space-separated apt packages auto-installed if missing | `tmux` | no |
+| `UNATTENDED_NUDGE_SEC` | unattended-only: send Enter after this many idle seconds to clear a stuck confirmation prompt (`0` disables) | `300` | no |
+| `REMOTE_CONTROL_REFRESH_SEC` | unattended-only: re-run `/remote-control` after this many idle seconds to refresh the connection (`0` disables) | `1200` | no |
+
+Editing `CLAUDE_ARGS` to remove `--permission-mode auto` changes the safety tradeoff described in `DESIGN.md` → Known limitations — read that first.
 
 Edit `/etc/claude-guardian/config.env` and `systemctl restart claude-guardian` to apply. Full reference: see `DESIGN.md` → Configuration reference.
 

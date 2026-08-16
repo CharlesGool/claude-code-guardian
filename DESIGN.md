@@ -10,11 +10,18 @@
 **Goals**
 - On a Debian-family server, keep exactly one `claude` (Claude Code CLI)
   process alive at all times, inside a detachable terminal multiplexer
-  session, so an operator can SSH in at any time and take over it.
+  session, so an operator can take over it remotely at any time — either
+  via Claude Code's own Remote Control (a `claude.ai/code/...` URL,
+  controllable from the web or a phone) or by SSH + `tmux attach`.
 - Survive a reboot (service starts at boot).
 - Survive the `claude` process itself being killed — Ctrl+C, crash, `exit`,
   OOM kill — by automatically restarting it within seconds, without losing
   the surrounding session.
+- Stay actually reachable through long unattended stretches, not just
+  "process is running": periodically clear confirmation prompts `auto`
+  permission mode may fall back to, and proactively refresh the Remote
+  Control connection before it can go stale (see Known limitations for the
+  safety tradeoff this implies).
 - Run preflight checks before every start: required `apt` packages present
   (auto-install if missing), `claude` binary present (hard requirement,
   never auto-installed), and a best-effort login/credential check
@@ -25,9 +32,10 @@
 - Installing or updating the Claude Code CLI itself. The operator is
   expected to have it installed and authenticated (or to authenticate
   interactively through the session this tool manages).
-- Providing the remote transport. This tool assumes SSH access to the host
-  already exists; it only keeps a `tmux` session alive for the operator to
-  attach to over that existing SSH connection.
+- Building a remote-access transport from scratch. This tool relies on
+  Claude Code's own `--remote-control` feature for the primary remote path,
+  and assumes SSH access to the host as a fallback; it only keeps a `tmux`
+  session alive for either to attach to.
 - Running multiple concurrent named Claude sessions. One default session is
   the supported configuration (see `DECISIONS.md`, 2026-08-16).
 - A GUI, web dashboard, or notification system. Status is read via
@@ -46,26 +54,42 @@ different mechanism:
    systemd (Restart=always) ---> claude-guardian run  (foreground loop)
                                     |
                                     | every CHECK_INTERVAL_SEC:
-                                    | tmux has-session? / pane_dead?
+                                    | tmux has-session? / pane_dead? / client attached?
+                                    | (if unattended: nudge Enter / refresh /remote-control
+                                    |  on their own longer intervals — see below)
                                     v
                      tmux session "claude-code" (remain-on-exit on)
                                     |
                                     v
-                              claude  (the actual CLI process)
-                                    ^
-                                    |
-                        operator: ssh + `claude-guardian attach`
-                             (tmux attach, remote takeover)
+                    claude --permission-mode auto --remote-control
+                                    ^                       ^
+                                    |                       |
+                        operator: ssh + `claude-guardian     operator: claude.ai
+                        attach` (tmux attach)                web/phone (Remote Control)
 ```
 
 - **systemd layer** recovers from: reboot, the supervisor script crashing,
   the whole tmux server disappearing. `Restart=always` plus a bounded
   `StartLimitBurst` stop it from spinning forever if `claude` is genuinely
-  missing (see Known limitations).
+  missing (see Known limitations). `KillMode=process` so `stop`/`restart`
+  only signals the tracked loop PID, never the tmux server or `claude`
+  (verified live — the default `KillMode=control-group` killed the whole
+  session, which is why this is explicit, not left at the systemd default).
 - **tmux layer** recovers from: the `claude` process itself exiting for any
   reason, while the *session* (its scrollback, its pty) is preserved. This
   is what makes Ctrl+C safe to send inside the session without losing state
-  — only `claude` exits and is respawned, the tmux session survives.
+  — only `claude` exits and is respawned, the tmux session survives. (Note:
+  Claude Code itself treats a single Ctrl+C as "interrupt this turn," not
+  exit — it takes two in a row, or `/exit`, to actually terminate the
+  process; verified against the real binary.)
+- **unattended keepalive** (new, see `DECISIONS.md` 2026-08-16 "always
+  remotely controllable"): when `tmux list-clients` shows nobody attached,
+  the loop periodically (a) sends a bare Enter to clear any confirmation
+  `--permission-mode auto` fell back to after repeated classifier blocks,
+  and (b) re-runs `/remote-control` to refresh the connection before
+  Anthropic's documented ~30-minute "could not reach the Remote Control
+  server" threshold can ever be hit. Both stop immediately once a client
+  attaches (checked every tick).
 - The two layers are deliberately independent: `systemctl stop
   claude-guardian` only stops the *supervision loop*; it does not kill the
   live tmux session, so an operator who is mid-conversation is not cut off
@@ -121,9 +145,11 @@ All variables live in `/etc/claude-guardian/config.env`, a plain `KEY="value"` s
 | `TMUX_SOCKET` | dedicated tmux server socket path | `/run/claude-guardian/tmux.sock` | no |
 | `WORKDIR` | working directory `claude` starts in | `/root` | no |
 | `CLAUDE_BIN` | `claude` executable name or absolute path | `claude` | no |
-| `CLAUDE_ARGS` | extra CLI args passed on every (re)start | *(empty)* | no |
+| `CLAUDE_ARGS` | extra CLI args passed on every (re)start | `--permission-mode auto --remote-control` | no |
 | `CHECK_INTERVAL_SEC` | seconds between liveness checks | `5` | no |
 | `REQUIRED_APT_PKGS` | space-separated apt packages auto-installed if missing | `tmux` | no |
+| `UNATTENDED_NUDGE_SEC` | unattended-only: seconds of no attached tmux client before sending a bare Enter to clear a stuck confirmation prompt; `0` disables | `300` | no |
+| `REMOTE_CONTROL_REFRESH_SEC` | unattended-only: seconds of no attached tmux client before re-running `/remote-control` to refresh the connection; `0` disables | `1200` | no |
 
 ## Setup from scratch
 
@@ -131,10 +157,11 @@ All variables live in `/etc/claude-guardian/config.env`, a plain `KEY="value"` s
 2. `bash bin/claude-guardian.sh check` — verify: prints the three check sections (`apt dependencies`, `claude CLI`, `login state`) with `[ok]`/`[missing]`/`[warn]` markers and does not modify anything.
 3. `bash bin/claude-guardian.sh install` — verify: ends with `install complete`; `systemctl is-enabled claude-guardian` prints `enabled`.
 4. `claude-guardian start` — verify: `systemctl is-active claude-guardian` prints `active`.
-5. `claude-guardian attach` — verify: drops you into a live `claude` terminal inside tmux. Detach with the tmux prefix (default `Ctrl+b`) then `d` — **not** Ctrl+C.
-6. From a second terminal, actually exit `claude` from inside the session and verify the respawn — e.g. `tmux -S /run/claude-guardian/tmux.sock send-keys -t claude-code C-c C-c` (Claude Code treats a single Ctrl+C as "interrupt current turn," matching most REPLs; it takes two in quick succession to actually exit, same as typing `/exit`). Verify: within `CHECK_INTERVAL_SEC`, `claude-guardian logs` shows a `respawning automatically` line, the `claude` PID (`pgrep -f '^claude$'`) has changed, and `claude-guardian attach` shows a live session again.
-7. `systemctl stop claude-guardian` then check `pgrep -f '^claude$'` — verify: the process is still running (stop only pauses supervision, see Known limitations on `KillMode`). `claude-guardian start` again — verify: the same `claude` PID is still there (supervision resumes against the existing session instead of recreating it).
-8. `reboot` the host — verify: after boot, `systemctl is-active claude-guardian` is `active` again without manual intervention.
+5. `claude-guardian attach` — verify: drops you into a live `claude` terminal inside tmux, and the pane shows a `/remote-control is active ... https://claude.ai/code/session_...` line — that URL is controllable from the web or a phone independent of this SSH session. Detach with the tmux prefix (default `Ctrl+b`) then `d` — **not** Ctrl+C.
+6. From a second terminal, actually exit `claude` from inside the session and verify the respawn — e.g. `tmux -S /run/claude-guardian/tmux.sock send-keys -t claude-code C-c C-c` (Claude Code treats a single Ctrl+C as "interrupt current turn," matching most REPLs; it takes two in quick succession to actually exit, same as typing `/exit`). Verify: within `CHECK_INTERVAL_SEC`, `claude-guardian logs` shows a `respawning automatically` line, the `claude` PID (`pgrep -f 'claude --permission-mode'`) has changed, and `claude-guardian attach` shows a live session again (with a new remote-control URL).
+7. `systemctl stop claude-guardian` then check `pgrep -f 'claude --permission-mode'` — verify: the process is still running (stop only pauses supervision, see Known limitations on `KillMode`). `claude-guardian start` again — verify: the same `claude` PID is still there (supervision resumes against the existing session instead of recreating it).
+8. Detach and leave the session unattended for longer than `UNATTENDED_NUDGE_SEC` — verify: `claude-guardian logs` shows a `sending Enter in case a prompt is stuck` line at that mark, and (after `REMOTE_CONTROL_REFRESH_SEC`) a `refreshing remote control connection` line, and neither fires again immediately after you reattach and detach once more (timers reset on attach).
+9. `reboot` the host — verify: after boot, `systemctl is-active claude-guardian` is `active` again without manual intervention.
 
 This project is not deployed with Docker; steps above are the full deployment procedure.
 
@@ -157,6 +184,22 @@ sufficient, without needing the rest of the repo.
 
 ## Known limitations & gotchas
 
+- **`UNATTENDED_NUDGE_SEC` (auto-Enter) is a deliberate, explicitly-approved
+  safety tradeoff, not a neutral convenience feature.** `--permission-mode
+  auto` falls back to an interactive confirmation after the classifier
+  blocks 3 actions in a row (or 20 total) — that fallback exists so a human
+  makes the call on something the classifier couldn't clear automatically.
+  Sending a bare Enter when unattended accepts whichever option is
+  currently highlighted/default, **without knowing whether that default is
+  the safe choice for that specific prompt.** This was flagged live by
+  Claude Code's own auto-mode classifier when the guardian tried to restart
+  with this behavior enabled ("defeats the human-in-the-loop safety
+  fallback") and required explicit user confirmation before deploying (see
+  `DECISIONS.md`, 2026-08-16). Set `UNATTENDED_NUDGE_SEC="0"` to disable it
+  if this tradeoff is not acceptable for a given deployment — the
+  documented alternative is `--permission-mode dontAsk` with an explicit
+  `permissions.allow` list, which denies unlisted actions silently instead
+  of guessing at a confirmation dialog (more predictable, more setup work).
 - **`claude-guardian install` auto-installs missing apt packages
   non-interactively** (`DEBIAN_FRONTEND=noninteractive apt-get install -y`).
   By default this is just `tmux`. If you widen `REQUIRED_APT_PKGS`, review
@@ -203,6 +246,21 @@ sufficient, without needing the rest of the repo.
   session still starts; `claude` itself will show its normal interactive
   login flow the first time someone attaches. The preflight check only logs
   a warning so operators know to expect it.
+- **`REMOTE_CONTROL_REFRESH_SEC`'s 1200s default is a proactive guess based
+  on documented behavior, not an exact reproduction.** Anthropic's docs
+  state a Remote Control session that "could not reach the Remote Control
+  server for about 30 minutes" needs a manual `/remote-control` to
+  reconnect; whether an idle-but-network-healthy session can go stale on
+  its own timeline was explicitly flagged as undocumented during research
+  for this feature. Refreshing at 20 minutes is comfortably inside the
+  documented 30-minute failure window either way.
+- **The unattended-nudge/refresh timers only start counting from when the
+  supervision loop itself (re)starts, not from whenever the session was
+  actually last attended.** This was a real bug caught live: the first
+  version initialized both timers to `0` (epoch), so any `systemctl
+  restart` against an already-unattended session fired an immediate nudge
+  and refresh instead of waiting out the configured interval. Fixed by
+  seeding both timers with the current time at loop start.
 
 ## How to extend
 

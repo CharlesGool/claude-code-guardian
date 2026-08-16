@@ -35,9 +35,19 @@ SESSION_NAME="claude-code"
 TMUX_SOCKET="/run/claude-guardian/tmux.sock"
 WORKDIR="/root"
 CLAUDE_BIN="claude"
-CLAUDE_ARGS=""
+CLAUDE_ARGS="--permission-mode auto --remote-control"
 CHECK_INTERVAL_SEC="5"
 REQUIRED_APT_PKGS="tmux"
+# When nobody is attached (no tmux client) for this many seconds, send a bare
+# Enter keystroke to clear any confirmation prompt auto mode fell back to
+# after repeated classifier blocks. 0 disables. See DESIGN.md Known limitations.
+UNATTENDED_NUDGE_SEC="300"
+# When nobody is attached for this many seconds, proactively re-run
+# /remote-control to refresh the connection — Anthropic's docs say a Remote
+# Control session that can't reach the server for ~30 minutes needs a manual
+# /remote-control to reconnect; refreshing well inside that window avoids
+# ever hitting it. 0 disables.
+REMOTE_CONTROL_REFRESH_SEC="1200"
 
 if [ -r "$CONFIG_FILE" ]; then
   # shellcheck disable=SC1090
@@ -159,6 +169,28 @@ respawn_pane() {
   tmux_cmd respawn-pane -k -t "$SESSION_NAME"
 }
 
+has_attached_client() {
+  [ -n "$(tmux_cmd list-clients -t "$SESSION_NAME" 2>/dev/null)" ]
+}
+
+# auto permission mode falls back to an interactive confirmation after
+# repeated classifier blocks (3 in a row or 20 total, per Anthropic's docs).
+# With nobody attached, that confirmation would otherwise sit forever.
+# Sending a bare Enter accepts whatever is currently highlighted/default.
+nudge_enter() {
+  log "no attached client for ${UNATTENDED_NUDGE_SEC}s+ — sending Enter in case a prompt is stuck waiting for confirmation"
+  tmux_cmd send-keys -t "$SESSION_NAME" Enter
+}
+
+# Remote Control sessions that can't reach the server for ~30 minutes need a
+# manual /remote-control to reconnect (Anthropic docs). Refresh proactively,
+# comfortably inside that window, so it's never actually hit.
+refresh_remote_control() {
+  log "no attached client for ${REMOTE_CONTROL_REFRESH_SEC}s+ — refreshing remote control connection"
+  tmux_cmd send-keys -t "$SESSION_NAME" C-u
+  tmux_cmd send-keys -t "$SESSION_NAME" "/remote-control" Enter
+}
+
 supervise_loop() {
   ensure_socket_dir
   log "supervision loop started: session=$SESSION_NAME socket=$TMUX_SOCKET interval=${CHECK_INTERVAL_SEC}s"
@@ -166,11 +198,37 @@ supervise_loop() {
   local stop=0
   trap 'stop=1' TERM INT
 
+  # Start the countdown from loop-start, not epoch 0 — otherwise a session
+  # that's already alive and unattended when the loop (re)starts (e.g. a
+  # systemd restart, or a reboot) triggers an immediate nudge/refresh
+  # instead of waiting out the configured interval first.
+  local last_nudge last_refresh
+  last_nudge=$(date +%s)
+  last_refresh=$(date +%s)
+
   while [ "$stop" -eq 0 ]; do
     if ! session_exists; then
       create_session
+      last_nudge=$(date +%s)
+      last_refresh=$(date +%s)
     elif pane_is_dead; then
       respawn_pane
+    elif has_attached_client; then
+      # someone is live in the session — never nudge/refresh while attended,
+      # and reset the timers so a nudge doesn't fire right after they leave
+      last_nudge=$(date +%s)
+      last_refresh=$(date +%s)
+    else
+      local now
+      now=$(date +%s)
+      if [ "$UNATTENDED_NUDGE_SEC" -gt 0 ] && [ $(( now - last_nudge )) -ge "$UNATTENDED_NUDGE_SEC" ]; then
+        nudge_enter
+        last_nudge=$now
+      fi
+      if [ "$REMOTE_CONTROL_REFRESH_SEC" -gt 0 ] && [ $(( now - last_refresh )) -ge "$REMOTE_CONTROL_REFRESH_SEC" ]; then
+        refresh_remote_control
+        last_refresh=$now
+      fi
     fi
     sleep "$CHECK_INTERVAL_SEC" &
     wait $! 2>/dev/null
@@ -204,14 +262,29 @@ WORKDIR="/root"
 # systemd's PATH (check with `command -v claude` as root)
 CLAUDE_BIN="claude"
 
-# extra arguments passed to claude on every (re)start, e.g. "--model sonnet"
-CLAUDE_ARGS=""
+# extra arguments passed to claude on every (re)start.
+# --permission-mode auto: use the auto-mode classifier instead of manual
+#   per-action approval (still safer than --dangerously-skip-permissions).
+# --remote-control: prints a claude.ai/code/... URL you can control the
+#   session from on the web or phone, independent of SSH.
+CLAUDE_ARGS="--permission-mode auto --remote-control"
 
 # seconds between liveness checks
 CHECK_INTERVAL_SEC="5"
 
 # space-separated apt package names auto-installed if missing
 REQUIRED_APT_PKGS="tmux"
+
+# when nobody is attached (no tmux client) this many seconds, send a bare
+# Enter to clear a confirmation prompt auto mode may have fallen back to.
+# 0 disables.
+UNATTENDED_NUDGE_SEC="300"
+
+# when nobody is attached this many seconds, proactively re-run
+# /remote-control to refresh the connection before Anthropic's ~30-minute
+# "could not reach the Remote Control server" threshold is ever hit.
+# 0 disables.
+REMOTE_CONTROL_REFRESH_SEC="1200"
 EOF
   log "wrote default config to $CONFIG_FILE"
 }

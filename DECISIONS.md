@@ -8,6 +8,58 @@ already-rejected option gets recommended again two weeks later.
 
 ---
 
+## 2026-08-16 — always remotely controllable: --remote-control default, and unattended auto-Enter accepted as an explicit tradeoff
+
+- **Context:** user reported the original design wasn't good enough for
+  "always remotely controllable" — specifically asked for
+  `claude --permission-mode auto --remote-control`, an auto-Enter mechanism
+  to clear stuck confirmations, and a fix for Claude Code becoming
+  uncontrollable after long inactivity.
+- **Decision:**
+  - `CLAUDE_ARGS` now defaults to `--permission-mode auto --remote-control`.
+    `--remote-control` was verified live to print a `claude.ai/code/...`
+    URL controllable from the web/phone, independent of SSH — this is now
+    the primary remote-control path, with SSH+`tmux attach` as a fallback
+    (DESIGN.md Goals/Architecture updated accordingly).
+  - Added an unattended-only keepalive in `supervise_loop`: when
+    `tmux list-clients` shows nobody attached, send a bare Enter after
+    `UNATTENDED_NUDGE_SEC` (default 300s) to clear any confirmation `auto`
+    mode fell back to, and re-run `/remote-control` after
+    `REMOTE_CONTROL_REFRESH_SEC` (default 1200s) to refresh the connection
+    before Anthropic's documented ~30-minute "could not reach the Remote
+    Control server" threshold. Sources: `claude --help` (flag existence,
+    verified locally), Anthropic's `remote-control.md` and
+    `permission-modes.md` docs (30-minute threshold, auto-mode fallback
+    behavior — via research, not independently reproduced end-to-end).
+  - The auto-Enter mechanism was **flagged live by Claude Code's own
+    auto-mode classifier** when first deployed ("defeats the
+    human-in-the-loop safety fallback without explicit user authorization")
+    — it accepts whatever option is currently highlighted/default without
+    knowing if that's the safe choice for that specific prompt. Presented
+    this tradeoff explicitly to the user (auto-Enter vs. the more
+    predictable but higher-setup `--permission-mode dontAsk` +
+    `permissions.allow` alternative); user confirmed proceeding with
+    auto-Enter as originally requested.
+- **Rejected:** `--permission-mode dontAsk` with an explicit
+  `permissions.allow` list — more predictable (denies unlisted actions
+  silently instead of guessing at a confirmation dialog) but requires the
+  operator to enumerate allowed actions up front. Not what was asked for;
+  documented in DESIGN.md Known limitations as the alternative to reach for
+  if the auto-Enter tradeoff turns out to be unacceptable in practice.
+- **Consequences:** an unattended, `auto`-mode confirmation prompt will be
+  auto-accepted at whatever is currently the default/highlighted option,
+  which is not guaranteed to be the safe choice — this is a real, accepted
+  safety tradeoff, not an oversight. `UNATTENDED_NUDGE_SEC="0"` disables it
+  per-deployment if that tradeoff needs to be revisited later. Also
+  surfaced (and fixed) two implementation bugs found only by testing this
+  live against the real `claude` binary and a real `systemctl restart`:
+  timers starting from epoch 0 instead of loop-start time (caused an
+  immediate spurious nudge/refresh on every restart of an
+  already-unattended session) — see DESIGN.md Known limitations for both
+  this and the separately-discovered `KillMode` bug.
+
+---
+
 ## 2026-08-16 — single default session, not multi-session templating
 
 - **Context:** deciding whether `claude-guardian` should support several
