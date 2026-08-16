@@ -44,7 +44,8 @@ claude-guardian attach
 
 - `systemctl is-active claude-guardian` prints `active`.
 - `claude-guardian attach` drops you into a live `claude` terminal. Detach with the tmux prefix (default `Ctrl+b`) then `d` — **not** Ctrl+C (see gotcha below).
-- Kill `claude` from inside the session (Ctrl+C is fine to test with) — within a few seconds `claude-guardian logs` shows a `respawning automatically` line, and attaching again shows `claude` running once more.
+- Actually exit `claude` from inside the session (press Ctrl+C **twice** in quick succession, or type `/exit` — a single Ctrl+C only interrupts the current turn, it does not exit) — within a few seconds `claude-guardian logs` shows a `respawning automatically` line, and attaching again shows `claude` running once more.
+- `systemctl stop claude-guardian` — `claude` keeps running (stop only pauses supervision, see gotcha below); `claude-guardian start` resumes watching it without restarting it.
 - `reboot` the host — after boot, `systemctl is-active claude-guardian` is `active` again without manual intervention.
 
 ## Configuration
@@ -71,7 +72,7 @@ claude-guardian stop       # stop supervision (the live tmux session is left run
 claude-guardian uninstall  # remove the systemd service (config and session left untouched)
 ```
 
-Gotcha: inside an attached session, Ctrl+C kills and immediately respawns `claude` by design (that's how a manual Ctrl+C is guaranteed to still leave an instance running) — it is not a clean way to detach. Use the tmux prefix + `d` instead.
+Gotcha: inside an attached session, Ctrl+C is interpreted by `claude` itself (interrupts the current turn; two in a row exits it, which then gets auto-respawned by design — a manual kill is guaranteed to still leave an instance running). Either way it is not a clean way to detach. Use the tmux prefix + `d` instead.
 
 ## License
 

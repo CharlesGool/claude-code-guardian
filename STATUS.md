@@ -2,11 +2,11 @@
 
 **Version:** unreleased · **Branch:** main
 **Notion:** not yet synced
-**Repo:** not yet created (private, pending `gh repo create`)
+**Repo:** https://github.com/CharlesGool/claude-code-watchdog (private)
 **Snapshots:** none yet
-**In progress:** initial implementation complete (`bin/claude-guardian.sh`: preflight, tmux/systemd two-layer supervision, install/uninstall/attach/logs/check CLI); smoke-tested locally against a fake `claude` binary (session create, auto-respawn on exit, clean SIGTERM shutdown all verified).
-**Next:** commit the initial skeleton, create the private GitHub remote, push. Then a real end-to-end test on this host (`bash bin/claude-guardian.sh install && claude-guardian start && claude-guardian attach`) before cutting v0.1.0.
-**Known issues:** not yet tested with the real `claude` binary under a live systemd unit (only the underlying tmux/loop logic was smoke-tested with a stand-in script) — do this before tagging v0.1.0.
+**In progress:** implementation complete and installed live on this host (`systemctl is-active claude-guardian` → active). Real end-to-end verification against the actual `claude` binary found and fixed two bugs: (1) `StartLimitIntervalSec` was in the wrong unit section (`[Service]` instead of `[Unit]`, systemd silently ignored it); (2) default `KillMode=control-group` killed the whole tmux session on `systemctl stop`/`restart`, contradicting the intended "stop only pauses supervision" behavior — fixed with explicit `KillMode=process`. Both fixes verified live: `stop`+`start` now leaves the same `claude` PID running; Ctrl+C-based respawn confirmed (Claude Code needs two Ctrl+C to actually exit, not one — docs updated to match).
+**Next:** cut v0.1.0 — bump CHANGELOG, retranslate DESIGN.zh.md/README.zh.md, tag, push, export snapshot, sync Notion.
+**Known issues:** none currently open. Reboot-survival (setup step 8) not yet independently verified on this host (would require an actual reboot); `enabled` state via `systemctl is-enabled` was confirmed instead.
 **Blocked on:** nothing.
 
 <!--

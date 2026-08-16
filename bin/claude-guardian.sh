@@ -222,15 +222,18 @@ write_unit_file() {
 Description=Claude Code guardian (keeps a remotely-attachable claude session alive)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple
 ExecStart=$INSTALL_BIN run
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=10
 User=root
+# Only signal the tracked loop PID on stop/restart, not the whole cgroup —
+# the tmux server (and claude inside it) must survive a supervisor restart.
+KillMode=process
 StandardOutput=journal
 StandardError=journal
 

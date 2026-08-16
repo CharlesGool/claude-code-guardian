@@ -131,9 +131,10 @@ All variables live in `/etc/claude-guardian/config.env`, a plain `KEY="value"` s
 2. `bash bin/claude-guardian.sh check` — verify: prints the three check sections (`apt dependencies`, `claude CLI`, `login state`) with `[ok]`/`[missing]`/`[warn]` markers and does not modify anything.
 3. `bash bin/claude-guardian.sh install` — verify: ends with `install complete`; `systemctl is-enabled claude-guardian` prints `enabled`.
 4. `claude-guardian start` — verify: `systemctl is-active claude-guardian` prints `active`.
-5. `claude-guardian attach` — verify: drops you into a live `claude` terminal inside tmux. Detach with the tmux prefix (default `Ctrl+b`) then `d` — **not** Ctrl+C, which is interpreted as killing `claude` (by design) and triggers an automatic respawn instead of a clean detach.
-6. From a second terminal, kill the `claude` process from inside the session (e.g. attach and press Ctrl+C, or `tmux -S /run/claude-guardian/tmux.sock send-keys -t claude-code C-c`) — verify: within `CHECK_INTERVAL_SEC`, `claude-guardian logs` shows a `respawning automatically` line and `claude-guardian attach` shows a live session again.
-7. `reboot` the host — verify: after boot, `systemctl is-active claude-guardian` is `active` again without manual intervention.
+5. `claude-guardian attach` — verify: drops you into a live `claude` terminal inside tmux. Detach with the tmux prefix (default `Ctrl+b`) then `d` — **not** Ctrl+C.
+6. From a second terminal, actually exit `claude` from inside the session and verify the respawn — e.g. `tmux -S /run/claude-guardian/tmux.sock send-keys -t claude-code C-c C-c` (Claude Code treats a single Ctrl+C as "interrupt current turn," matching most REPLs; it takes two in quick succession to actually exit, same as typing `/exit`). Verify: within `CHECK_INTERVAL_SEC`, `claude-guardian logs` shows a `respawning automatically` line, the `claude` PID (`pgrep -f '^claude$'`) has changed, and `claude-guardian attach` shows a live session again.
+7. `systemctl stop claude-guardian` then check `pgrep -f '^claude$'` — verify: the process is still running (stop only pauses supervision, see Known limitations on `KillMode`). `claude-guardian start` again — verify: the same `claude` PID is still there (supervision resumes against the existing session instead of recreating it).
+8. `reboot` the host — verify: after boot, `systemctl is-active claude-guardian` is `active` again without manual intervention.
 
 This project is not deployed with Docker; steps above are the full deployment procedure.
 
@@ -167,15 +168,28 @@ sufficient, without needing the rest of the repo.
   forever; after that the service sits in `failed` state until you install
   `claude` and run `systemctl reset-failed claude-guardian && systemctl
   start claude-guardian`.
-- **`systemctl stop claude-guardian` does not kill the live session.** This
-  is intentional (see Architecture) — it stops supervision, not the
-  operator's terminal. To fully tear down, kill the tmux session
+- **`systemctl stop claude-guardian` does not kill the live session — this
+  required `KillMode=process` in the unit, verified against the real
+  binary.** systemd's *default* `KillMode` is `control-group`, which would
+  SIGTERM the entire cgroup on stop/restart, including the tmux server and
+  `claude` itself (this was caught live: the first version of the unit had
+  no explicit `KillMode` and a `systemctl restart` silently killed and
+  recreated the session). With `KillMode=process`, only the tracked loop
+  PID is signaled, so `claude` and its tmux session survive a
+  `stop`/`restart` of the supervisor. One side effect: systemd logs a
+  benign `Found left-over process ... in control group` notice on the next
+  `start`, because the previous `claude` process is still in the cgroup —
+  this is expected, not an error. To fully tear down, kill the tmux session
   explicitly: `tmux -S $TMUX_SOCKET kill-session -t $SESSION_NAME`.
-- **Detach with the tmux prefix, not Ctrl+C.** Ctrl+C is sent straight to
-  `claude` and is treated the same as a crash — the pane is respawned. This
-  is the intended behavior (per the original requirement: a manual Ctrl+C
-  must never leave zero live instances), but it means Ctrl+C is not a clean
-  way to step away from the session.
+- **Detach with the tmux prefix, not Ctrl+C — and a single Ctrl+C does not
+  kill `claude` anyway.** Verified against the real CLI: Claude Code treats
+  one Ctrl+C as "interrupt the current turn" (like most REPLs), not exit —
+  the pane stays alive and nothing is respawned. It takes two Ctrl+C in
+  quick succession (or `/exit`) to actually terminate the process, at which
+  point the pane dies and the guardian respawns it, per the original
+  requirement that a deliberate kill must never leave zero live instances.
+  Regardless of how many Ctrl+C it takes to exit, it is not a clean way to
+  step away from the session — always use the tmux prefix + `d`.
 - **The repo, when checked out on the maintenance NAS mount at
   `/root/MyGithub_Project`, lives on a CIFS filesystem mounted with a fixed
   `file_mode=0644`** — `chmod +x` on `bin/claude-guardian.sh` is a silent
