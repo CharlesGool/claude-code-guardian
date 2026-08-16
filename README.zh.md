@@ -12,7 +12,7 @@
 - `claude` 无论因何退出，都会在几秒内自动重新拉起——tmux 会话（连同其滚动记录）不受影响。
 - 整个监督进程或宿主机重启后，systemd 会自动把它带回来。
 - 无人接管期间会定期"敲一下"会话，防止它悄悄卡死或变得不可达：发送 Enter 清除 `auto` 权限模式在多次被分类器拦截后可能回退出现的确认弹窗，并在 Anthropic 文档所述的约 30 分钟"不可达"阈值到来之前主动重新执行 `/remote-control`。这里涉及的安全权衡见 `DESIGN.md` → Known limitations。
-- 启动前跑前置检查：自动安装缺失的 `apt` 包（默认只有 `tmux`），确认 `claude` 在 `PATH` 上，未检测到登录凭据时只警告、不阻塞。
+- 前置检查：自动安装缺失的 `apt` 包（默认只有 `tmux`），确认 `claude` 在 `PATH` 上。`install` 阶段如果 `claude` 还没登录（通过 `claude auth status` 检测）会直接拒绝继续；装完之后，`run` 阶段对登录状态只警告不阻塞，这样服务后续如果丢失登录状态也会继续重试，而不是直接启动失败。
 - 提供 `attach` 命令，供远程操作者通过 SSH 接管这个常驻会话，作为 claude.ai 远程控制链接之外的备用方式。
 
 非目标：本工具不负责安装或更新 Claude Code CLI 本身，也不管理多个并存的命名会话（详见 `DESIGN.md`）。
@@ -22,6 +22,7 @@
 - 操作系统：Debian 或其衍生发行版（Ubuntu 等），需要 systemd
 - 必须以 root 身份运行
 - `claude` 已经安装好并且能在 `PATH`（或 `CLAUDE_BIN` 指定的路径）上找到——本工具不负责安装它
+- `claude` 已经登录（`claude auth status` 必须成功）——否则 `install` 会拒绝继续，先执行 `claude auth login`
 - 如果 `tmux` 还没装，需要能访问外网走 `apt-get`
 
 ## 安装

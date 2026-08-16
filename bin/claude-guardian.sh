@@ -75,6 +75,13 @@ require_root() {
   [ "$(id -u)" -eq 0 ] || die "must be run as root"
 }
 
+# Authoritative login check (not a file-existence guess): `claude auth
+# status` exits 0 when logged in, 1 when not — verified directly against
+# both states, including under an isolated HOME with no credentials at all.
+is_logged_in() {
+  "$CLAUDE_BIN" auth status >/dev/null 2>&1
+}
+
 # ---- preflight ---------------------------------------------------------
 
 # Report-only: never mutates the system. Used by `check`.
@@ -109,17 +116,15 @@ preflight_report() {
     fi
   fi
 
-  echo "== login state (best-effort) =="
-  local cred_found=0
-  for f in "$HOME/.claude/.credentials.json" "$HOME/.config/claude/credentials.json" "$HOME/.claude.json"; do
-    if [ -e "$f" ]; then
-      echo "  [ok]      found $f"
-      cred_found=1
-    fi
-  done
-  if [ "$cred_found" -eq 0 ]; then
-    echo "  [warn]    no known credential file found — claude may not be logged in yet"
-    echo "            this does not block startup; run '$PROG_NAME attach' and log in interactively"
+  echo "== login state =="
+  if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
+    echo "  [skip]    can't check — claude CLI not found (see above)"
+  elif is_logged_in; then
+    echo "  [ok]      $CLAUDE_BIN auth status reports logged in"
+  else
+    echo "  [missing] $CLAUDE_BIN auth status reports not logged in"
+    echo "            'install' refuses to proceed until this is fixed: run '$CLAUDE_BIN auth login' first"
+    ok=1
   fi
 
   return "$ok"
@@ -164,11 +169,18 @@ preflight_enforce() {
     fi
   fi
 
-  local cred_found=0
-  for f in "$HOME/.claude/.credentials.json" "$HOME/.config/claude/credentials.json" "$HOME/.claude.json"; do
-    [ -e "$f" ] && cred_found=1
-  done
-  [ "$cred_found" -eq 1 ] || log "warning: no claude login credentials detected yet; run '$PROG_NAME attach' to log in interactively (this does not block the service)"
+  is_logged_in || log "warning: claude is not logged in ('$CLAUDE_BIN auth status' failed); run '$PROG_NAME attach' to log in interactively (this does not block the running service — only 'install' hard-requires login)"
+}
+
+# Hard requirement for `install` only — deliberately not folded into
+# preflight_enforce, which stays non-blocking on login state so an
+# already-running service that later loses auth keeps retrying instead of
+# refusing to start. Installing a guardian that has never once logged in
+# would just sit respawning a session nobody can use yet, so that specific
+# case is refused outright instead.
+require_login() {
+  is_logged_in \
+    || die "claude is not logged in ('$CLAUDE_BIN auth status' failed). Log in first — run '$CLAUDE_BIN auth login', or 'claude' interactively — then retry install."
 }
 
 # ---- tmux session management -------------------------------------------
@@ -397,6 +409,7 @@ cmd_run() {
 
 cmd_install() {
   preflight_enforce
+  require_login
   write_default_config
   # re-source in case this is a first install and defaults above differ
   # shellcheck disable=SC1090

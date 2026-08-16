@@ -8,6 +8,37 @@ already-rejected option gets recommended again two weeks later.
 
 ---
 
+## 2026-08-16 — `install` hard-refuses if claude isn't logged in; login check switched to `claude auth status`
+
+- **Context:** user asked for a login check that actually blocks
+  installation if Claude Code isn't logged in yet (previously, missing
+  login only ever produced a warning, at both `install` and `run`).
+- **Decision:**
+  - Discovered `claude auth status` (JSON output, `loggedIn` field) is a
+    real, authoritative auth check — verified directly: exits 0 when
+    logged in, exits 1 under an isolated `HOME` with zero credentials.
+    Replaced the old file-existence heuristic (checking for
+    `~/.claude/.credentials.json` etc.) with this everywhere login state
+    is checked, since a stale/invalid credentials file would have passed
+    the old heuristic without actually being usable.
+  - Added `require_login()`, called only from `cmd_install`, which `die`s
+    if `claude auth status` fails — verified end-to-end with a fake
+    logged-out `HOME` that `cmd_install` refuses and writes no config file.
+  - `preflight_enforce` (shared by `run` and `install`) keeps its existing
+    non-blocking behavior, just using the more accurate check now.
+- **Rejected:** folding the hard block into `preflight_enforce` itself,
+  which would also have made `run`/the live systemd service hard-fail if
+  login was ever lost after a successful install — out of scope for what
+  was actually asked (which was specifically about *installing*), and
+  would turn a recoverable situation (re-login via `attach`) into a
+  restart-fail loop for an already-working deployment.
+- **Consequences:** `install` now requires `claude auth login` (or any
+  other already-completed login) to have happened first — deploying the
+  guardian and only then logging in interactively via `attach` is no
+  longer possible; login must come first.
+
+---
+
 ## 2026-08-16 — double Enter (not single) on first run and unattended nudge; added `purge` command
 
 - **Context:** user reported the first-ever deployment needed Enter pressed

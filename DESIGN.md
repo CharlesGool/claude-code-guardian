@@ -22,10 +22,14 @@
   permission mode may fall back to, and proactively refresh the Remote
   Control connection before it can go stale (see Known limitations for the
   safety tradeoff this implies).
-- Run preflight checks before every start: required `apt` packages present
-  (auto-install if missing), `claude` binary present (hard requirement,
-  never auto-installed), and a best-effort login/credential check
-  (informational only, never blocks startup).
+- Run preflight checks: required `apt` packages present (auto-install if
+  missing), `claude` binary present (hard requirement, never
+  auto-installed). Login state is checked via `claude auth status`
+  (authoritative, not a file-existence guess) — `install` refuses to
+  proceed if not logged in (an installed-but-never-logged-in guardian
+  would just sit respawning a session nobody can use), while `run` only
+  warns, so a service that later loses auth keeps retrying instead of
+  refusing to start.
 - Be operable with a small, memorable CLI (`claude-guardian <verb>`).
 
 **Non-goals**
@@ -253,10 +257,15 @@ sufficient, without needing the rest of the repo.
   bits checks it out executable regardless. If your local working copy
   can't hold the exec bit, invoke the script explicitly with
   `bash bin/claude-guardian.sh ...` rather than `./bin/claude-guardian.sh`.
-- **Login is never enforced.** If `claude` has no valid credentials, the
-  session still starts; `claude` itself will show its normal interactive
-  login flow the first time someone attaches. The preflight check only logs
-  a warning so operators know to expect it.
+- **Login is enforced at `install` time only, not continuously.** `install`
+  hard-refuses if `claude auth status` fails (verified against both real
+  states: logged in, and an isolated `HOME` with no credentials at all —
+  exits 0 vs. 1 respectively). Once installed, `run` only warns if auth is
+  missing or later lost — the service keeps retrying and `claude` shows its
+  normal interactive login flow the next time someone attaches, rather than
+  refusing to start. This is deliberate, not an oversight: a service that
+  was working and later loses auth (expired token, revoked session) should
+  keep trying to serve, not go into a restart-fail loop.
 - **`REMOTE_CONTROL_REFRESH_SEC`'s 1200s default is a proactive guess based
   on documented behavior, not an exact reproduction.** Anthropic's docs
   state a Remote Control session that "could not reach the Remote Control

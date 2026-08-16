@@ -13,7 +13,7 @@
 - 扛得住重启（服务开机自启）。
 - 扛得住 `claude` 进程本身被杀——Ctrl+C、崩溃、`exit`、OOM kill——几秒内自动重新拉起，且不丢失周围的会话环境。
 - 在长时间无人值守的情况下依然保持真正可达，而不只是"进程还在跑"：定期清除 `auto` 权限模式可能回退出现的确认弹窗，并在 Remote Control 连接变得陈旧之前主动刷新它（这里涉及的安全权衡见 Known limitations）。
-- 每次启动前都跑前置检查：所需 `apt` 包是否存在（缺失自动装）、`claude` 可执行文件是否存在（硬性要求，绝不自动安装）、尽力而为的登录/凭据检查（仅提示，不阻塞启动）。
+- 前置检查：所需 `apt` 包是否存在（缺失自动装）、`claude` 可执行文件是否存在（硬性要求，绝不自动安装）。登录状态通过 `claude auth status` 检测（权威判断，不是靠猜文件存不存在）——`install` 阶段如果没登录会直接拒绝继续（一个从未登录过就装上的 guardian，只会一直重新拉起一个谁也用不了的会话）；`run` 阶段只警告，这样一个原本能用、后来登录状态失效的服务会继续重试，而不是直接拒绝启动。
 - 用一套小巧好记的 CLI（`claude-guardian <动词>`）就能操作。
 
 **非目标**
@@ -140,7 +140,7 @@ repo/
 - **`systemctl stop claude-guardian` 不会杀掉存活的会话——这需要在 unit 里显式写 `KillMode=process`，并且是对着真实二进制验证过的。** systemd 的*默认* `KillMode` 是 `control-group`，会在 stop/restart 时对整个 cgroup 发 SIGTERM，包括 tmux server 和 `claude` 本身（这是实测抓到的：unit 最初版本没有显式写 `KillMode`，一次 `systemctl restart` 就悄悄把会话杀掉又重建了）。用了 `KillMode=process` 之后，只有被追踪的循环 PID 会收到信号，所以 `claude` 和它的 tmux 会话能扛过监督者的一次 `stop`/`restart`。一个副作用：systemd 会在下一次 `start` 时打印一条无害的 `Found left-over process ... in control group` 提示，因为之前的 `claude` 进程还留在那个 cgroup 里——这是预期行为，不是错误。要彻底拆除，执行 `claude-guardian purge`（或手动执行：`tmux -S $TMUX_SOCKET kill-session -t $SESSION_NAME`）。
 - **退出请用 tmux 前缀键，不要用 Ctrl+C——而且单次 Ctrl+C 本来就杀不死 `claude`。** 对着真实 CLI 验证过：Claude Code 把单次 Ctrl+C 当作"打断当前轮次"（跟大多数 REPL 一样），而不是退出——pane 会继续存活，也不会触发任何重新拉起。要连按两次 Ctrl+C（或者 `/exit`）才会真正终止进程，此时 pane 才会死掉，guardian 才会把它重新拉起来——这正好对应最初的需求：手动杀掉也必须保证还有实例在跑。不管需要按几次 Ctrl+C 才能退出，它都不是一种干净的"离开会话"方式——请始终使用 tmux 前缀键 + `d`。
 - **如果你的工作副本位于挂载参数固定了 `file_mode` 的 CIFS/SMB 文件系统上（NAS 挂载的开发环境常见这种情况），对 `bin/claude-guardian.sh` 执行 `chmod +x` 可能是静默无效的**（退出码 0，权限位没有变化——开发过程中实际遇到过）。可执行位改为在提交时直接写进 git 树：`git update-index --chmod=+x bin/claude-guardian.sh`，所以在支持真实权限位的文件系统上正常 `git clone` 出来的文件都会是可执行的，不受影响。如果你本地的工作副本没法保留可执行位，请显式用 `bash bin/claude-guardian.sh ...` 而不是 `./bin/claude-guardian.sh`。
-- **登录状态从不被强制要求。** 如果 `claude` 没有有效凭据，会话依然会启动；`claude` 自己会在第一次有人 attach 时显示它正常的交互式登录流程。前置检查只会记一条警告日志，让操作者心里有数。
+- **登录状态只在 `install` 阶段被强制要求，不是持续强制的。** `install` 如果 `claude auth status` 失败就会直接拒绝（已经对着两种真实状态验证过：已登录 exit 0，用一个完全没有凭据的隔离 `HOME` 测试 exit 1）。装完之后，`run` 阶段对登录状态缺失或后续丢失只会警告——服务会继续重试，`claude` 会在下次有人 attach 时正常显示交互式登录流程，而不是拒绝启动。这是刻意设计，不是遗漏：一个原本能正常工作、后来登录状态失效（token 过期、会话被吊销）的服务应该继续尝试提供服务，而不是陷入重启失败循环。
 - **`REMOTE_CONTROL_REFRESH_SEC` 默认 1200 秒是基于已有文档做出的主动预防性猜测，不是对某个已知精确阈值的复现。** Anthropic 的文档里写的是，一个"无法连接到 Remote Control 服务器持续约 30 分钟"的会话需要手动执行一次 `/remote-control` 才能重连；至于一个网络本身健康、只是长期无人操作的会话是否会按自己的节奏变得陈旧，在做这个功能的调研时被明确标记为文档未覆盖、无法确认。不管怎样，20 分钟去刷新，都稳稳落在文档所述的 30 分钟失败窗口以内。
 - **无人值守 nudge/refresh 这两个定时器，只从监督循环本身（重新）启动的那一刻开始计时，而不是从会话真正最后一次有人接管的时刻开始。** 这是一个实测抓到的真实 bug：最初的版本把两个定时器都初始化为 `0`（epoch），导致任何一次针对已经无人值守的会话执行的 `systemctl restart`，都会立刻触发一次多余的 nudge 和 refresh，而不是先等满配置的间隔。修复方式是让两个定时器都在循环启动时用当前时间做种子。
 

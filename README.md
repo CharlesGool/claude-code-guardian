@@ -10,7 +10,7 @@ Keeps at least one remotely-attachable Claude Code (`claude`) session alive on a
 - If `claude` exits for any reason, it is respawned automatically within a few seconds — the tmux session (and its scrollback) survives.
 - If the whole supervisor or the host reboots, systemd brings it back automatically.
 - While nobody is attached, periodically nudges the session so it can't go silently stuck or unreachable: sends Enter to clear any confirmation `auto` permission mode fell back to after repeated classifier blocks, and proactively re-runs `/remote-control` well before Anthropic's ~30-minute "unreachable" threshold. See `DESIGN.md` → Known limitations for the safety tradeoff this involves.
-- Runs preflight checks before starting: auto-installs missing `apt` packages (`tmux` by default), verifies `claude` is on `PATH`, and warns (without blocking) if no login credentials are detected.
+- Runs preflight checks: auto-installs missing `apt` packages (`tmux` by default), verifies `claude` is on `PATH`. `install` refuses to proceed if `claude` isn't logged in yet (checked via `claude auth status`); once installed, `run` only warns on login state so a service that later loses auth keeps retrying instead of failing to start.
 - Ships an `attach` command for remote operators to take over the live session over SSH, as an alternative to the claude.ai remote-control URL.
 
 Non-goals: it does not install or update the Claude Code CLI itself, and it does not manage multiple concurrent named sessions (see `DESIGN.md`).
@@ -20,6 +20,7 @@ Non-goals: it does not install or update the Claude Code CLI itself, and it does
 - OS: Debian or a Debian-derivative with systemd (Ubuntu, etc.)
 - Must be run as root
 - `claude` already installed and reachable on `PATH` (or via `CLAUDE_BIN`) — this tool does not install it
+- `claude` already logged in (`claude auth status` must succeed) — `install` refuses to proceed otherwise; run `claude auth login` first
 - Internet access for `apt-get` if `tmux` is not already installed
 
 ## Install
