@@ -75,6 +75,7 @@ claude-guardian status     # systemctl status
 claude-guardian logs       # follow the service journal
 claude-guardian stop       # stop supervision (the live tmux session is left running)
 claude-guardian uninstall  # remove the systemd service (config and session left untouched)
+claude-guardian purge      # full teardown: uninstall + kill the session + remove config/binary
 ```
 
 Gotcha: inside an attached session, Ctrl+C is interpreted by `claude` itself (interrupts the current turn; two in a row exits it, which then gets auto-respawned by design — a manual kill is guaranteed to still leave an instance running). Either way it is not a clean way to detach. Use the tmux prefix + `d` instead.

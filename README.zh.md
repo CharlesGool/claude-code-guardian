@@ -77,6 +77,7 @@ claude-guardian status     # systemctl status
 claude-guardian logs       # 跟踪服务日志
 claude-guardian stop       # 停止监督（tmux 会话本身继续运行）
 claude-guardian uninstall  # 移除 systemd 服务（配置和会话都不受影响）
+claude-guardian purge      # 彻底卸载：uninstall + 杀掉会话 + 删除配置和已安装的二进制
 ```
 
 坑：在已 attach 的会话里，Ctrl+C 是被 `claude` 自己解释的（打断当前轮次；连按两次才会退出，退出后会按设计被自动重新拉起——这样才能保证手动杀掉也一定还有实例在跑）。不管哪种情况，这都不是一种干净的"离开会话"方式。请用 tmux 前缀键 + `d`。

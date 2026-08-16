@@ -82,19 +82,29 @@ different mechanism:
   Claude Code itself treats a single Ctrl+C as "interrupt this turn," not
   exit — it takes two in a row, or `/exit`, to actually terminate the
   process; verified against the real binary.)
-- **unattended keepalive** (new, see `DECISIONS.md` 2026-08-16 "always
-  remotely controllable"): when `tmux list-clients` shows nobody attached,
-  the loop periodically (a) sends a bare Enter to clear any confirmation
-  `--permission-mode auto` fell back to after repeated classifier blocks,
-  and (b) re-runs `/remote-control` to refresh the connection before
-  Anthropic's documented ~30-minute "could not reach the Remote Control
-  server" threshold can ever be hit. Both stop immediately once a client
-  attaches (checked every tick).
+- **unattended keepalive** (see `DECISIONS.md` 2026-08-16 "always remotely
+  controllable"): when `tmux list-clients` shows nobody attached, the loop
+  periodically (a) sends Enter — twice, one second apart — to clear any
+  confirmation `--permission-mode auto` fell back to after repeated
+  classifier blocks, and (b) re-runs `/remote-control` to refresh the
+  connection before Anthropic's documented ~30-minute "could not reach the
+  Remote Control server" threshold can ever be hit. Both stop immediately
+  once a client attaches (checked every tick). `create_session` sends the
+  same double Enter right after starting `claude`, for the same reason: a
+  genuinely first-ever run can show an onboarding/trust screen that needs
+  two Enters to clear, and that shouldn't have to wait for the first
+  unattended-nudge interval to pass. A second Enter once `claude` is
+  already sitting at its normal prompt is a harmless no-op either way, so
+  there's no downside to always sending two instead of trying to detect
+  which screen is showing.
 - The two layers are deliberately independent: `systemctl stop
   claude-guardian` only stops the *supervision loop*; it does not kill the
   live tmux session, so an operator who is mid-conversation is not cut off
-  by routine maintenance. Full teardown is a separate, explicit step (see
-  `uninstall` in README).
+  by routine maintenance. Full teardown is a separate, explicit step —
+  `uninstall` (systemd only, session/config left alone, for routine
+  maintenance) vs. `purge` (everything: session, socket, config directory,
+  installed binary — an explicit, deliberate "remove it all" command, see
+  README).
 
 ## Tech stack
 
@@ -222,8 +232,8 @@ sufficient, without needing the rest of the repo.
   `stop`/`restart` of the supervisor. One side effect: systemd logs a
   benign `Found left-over process ... in control group` notice on the next
   `start`, because the previous `claude` process is still in the cgroup —
-  this is expected, not an error. To fully tear down, kill the tmux session
-  explicitly: `tmux -S $TMUX_SOCKET kill-session -t $SESSION_NAME`.
+  this is expected, not an error. To fully tear down, run `claude-guardian
+  purge` (or manually: `tmux -S $TMUX_SOCKET kill-session -t $SESSION_NAME`).
 - **Detach with the tmux prefix, not Ctrl+C — and a single Ctrl+C does not
   kill `claude` anyway.** Verified against the real CLI: Claude Code treats
   one Ctrl+C as "interrupt the current turn" (like most REPLs), not exit —

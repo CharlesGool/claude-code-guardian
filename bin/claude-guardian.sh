@@ -21,6 +21,7 @@
 # Usage: claude-guardian <command>
 #   install     preflight checks, then install + enable the systemd service
 #   uninstall   stop/disable the systemd service (session/config untouched)
+#   purge       full teardown: uninstall + kill session + remove config/binary
 #   start       systemctl start claude-guardian
 #   stop        systemctl stop claude-guardian
 #   restart     systemctl restart claude-guardian
@@ -195,6 +196,16 @@ create_session() {
   # shellcheck disable=SC2086
   tmux_cmd new-session -d -s "$SESSION_NAME" -n claude -c "$WORKDIR" -- "$CLAUDE_BIN" $CLAUDE_ARGS
   tmux_cmd set-option -t "$SESSION_NAME" remain-on-exit on
+
+  # On a genuinely first-ever run, claude can show an onboarding/trust
+  # screen that needs Enter to accept the default before it reaches the
+  # normal prompt — observed needing two Enters, not one. An extra Enter
+  # once claude is already at its normal prompt is a harmless no-op, so
+  # send two rather than trying to detect exactly which screen is showing.
+  sleep 2
+  tmux_cmd send-keys -t "$SESSION_NAME" Enter
+  sleep 1
+  tmux_cmd send-keys -t "$SESSION_NAME" Enter
 }
 
 respawn_pane() {
@@ -209,9 +220,14 @@ has_attached_client() {
 # auto permission mode falls back to an interactive confirmation after
 # repeated classifier blocks (3 in a row or 20 total, per Anthropic's docs).
 # With nobody attached, that confirmation would otherwise sit forever.
-# Sending a bare Enter accepts whatever is currently highlighted/default.
+# Sending Enter accepts whatever is currently highlighted/default. Two
+# presses, not one: some prompts (e.g. first-run onboarding) need a second
+# Enter to actually clear, and an extra Enter once claude is already at its
+# normal prompt is a harmless no-op.
 nudge_enter() {
-  log "no attached client for ${UNATTENDED_NUDGE_SEC}s+ — sending Enter in case a prompt is stuck waiting for confirmation"
+  log "no attached client for ${UNATTENDED_NUDGE_SEC}s+ — sending Enter (x2) in case a prompt is stuck waiting for confirmation"
+  tmux_cmd send-keys -t "$SESSION_NAME" Enter
+  sleep 1
   tmux_cmd send-keys -t "$SESSION_NAME" Enter
 }
 
@@ -405,6 +421,35 @@ cmd_uninstall() {
   log "systemd service removed. Config ($CONFIG_FILE) and any running tmux session were left untouched."
   log "to also remove the config: rm -rf $(dirname "$CONFIG_FILE")"
   log "to also kill the live session: tmux -S $TMUX_SOCKET kill-session -t $SESSION_NAME"
+  log "or run '$PROG_NAME purge' to do all of the above (and remove the installed binary) in one step"
+}
+
+# Full teardown: everything `uninstall` deliberately leaves behind, plus the
+# live tmux session/socket and the installed binary. Unlike `uninstall`,
+# this kills any in-progress claude session — it's the explicit "remove
+# everything" command, not the routine-maintenance one.
+cmd_purge() {
+  require_root
+
+  systemctl disable --now claude-guardian.service 2>/dev/null || true
+  rm -f "$UNIT_PATH"
+  systemctl daemon-reload
+  systemctl reset-failed claude-guardian 2>/dev/null || true
+  log "systemd service stopped, disabled, and unit file removed"
+
+  if command -v tmux >/dev/null 2>&1 && [ -S "$TMUX_SOCKET" ]; then
+    tmux_cmd kill-server 2>/dev/null || true
+    log "killed tmux server on $TMUX_SOCKET (session '$SESSION_NAME' and claude with it)"
+  fi
+  rm -rf "$(dirname "$TMUX_SOCKET")"
+
+  rm -rf "$(dirname "$CONFIG_FILE")"
+  log "removed config directory $(dirname "$CONFIG_FILE")"
+
+  rm -f "$INSTALL_BIN"
+  log "removed installed binary $INSTALL_BIN"
+
+  log "purge complete. Not touched: the claude CLI itself, its login credentials, and any git clone of this repo."
 }
 
 cmd_attach() {
@@ -419,7 +464,11 @@ cmd_logs() {
 }
 
 usage() {
-  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  # Pattern range instead of fixed line numbers — a fixed range silently
+  # went stale (and printed the wrong text) the moment the header comment
+  # above it grew, e.g. when the GPL notice was added. Matching on the
+  # "Usage:" line itself instead can't drift out of sync with edits above it.
+  sed -n '/^# Usage:/,/^#   run /p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 main() {
@@ -428,6 +477,7 @@ main() {
   case "$cmd" in
     install)   cmd_install "$@" ;;
     uninstall) cmd_uninstall "$@" ;;
+    purge)     cmd_purge "$@" ;;
     start)     require_root; systemctl start claude-guardian ;;
     stop)      require_root; systemctl stop claude-guardian ;;
     restart)   require_root; systemctl restart claude-guardian ;;

@@ -8,6 +8,52 @@ already-rejected option gets recommended again two weeks later.
 
 ---
 
+## 2026-08-16 — double Enter (not single) on first run and unattended nudge; added `purge` command
+
+- **Context:** user reported the first-ever deployment needed Enter pressed
+  twice before `claude` reached its normal prompt (likely an
+  onboarding/trust screen), and asked to always send two — noting an extra
+  Enter once already at the normal prompt costs nothing. Separately asked
+  for a genuinely complete uninstall that removes everything, not just the
+  systemd service.
+- **Decision:**
+  - `create_session` now sends Enter twice (one second apart) right after
+    starting `claude`, instead of relying solely on the unattended-nudge
+    timer to eventually clear a first-run screen.
+  - `nudge_enter` now also sends Enter twice instead of once, for the same
+    reason — verified with a real functional test (a stdin-line-counting
+    fake process) that both paths send exactly two keystrokes, correctly
+    timed, and that the full `supervise_loop` fires them at the right
+    tick.
+  - Added `claude-guardian purge`: stops/disables/removes the systemd
+    unit (like `uninstall`), plus kills the tmux server, and removes the
+    config directory and the installed binary. `uninstall` itself is
+    unchanged — still the safe, routine-maintenance command that leaves
+    the live session and config alone; `purge` is the new, explicit,
+    deliberately destructive "remove everything" command.
+  - While making this change, also found and fixed a latent bug: `usage()`
+    used a hardcoded `sed -n '2,25p'` line range that had already gone
+    stale (silently, no error) when the GPL header was added in an earlier
+    commit, printing the wrong help text. Replaced with a pattern-matched
+    range (`/^# Usage:/,/^#   run /p`) that can't drift out of sync with
+    edits to the header above it.
+- **Rejected:** trying to detect which specific screen is showing (trust
+  dialog vs. onboarding vs. already-normal-prompt) before deciding how many
+  Enters to send — not worth the added fragility when a harmless extra
+  Enter achieves the same result. Also rejected changing `uninstall`'s
+  existing behavior instead of adding a separate `purge` command — the
+  safe default (leave the session running) is a deliberate, already-tested
+  property worth keeping distinct from a full teardown.
+- **Consequences:** `purge` unconditionally kills any live claude session —
+  documented clearly as the difference from `uninstall`. Not covered by an
+  end-to-end test against the real systemd unit on this host (that would
+  have torn down the live production deployment); verified by code review
+  and by re-using the already-tested `cmd_uninstall` pattern plus
+  straightforward `rm -rf` on paths this tool itself owns
+  (`/etc/claude-guardian`, `/run/claude-guardian`, the installed binary).
+
+---
+
 ## 2026-08-16 — resolve CLAUDE_BIN to an absolute path, don't trust systemd's PATH
 
 - **Context:** a fresh `install` on a second host succeeded, but the
