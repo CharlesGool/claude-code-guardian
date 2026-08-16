@@ -1,4 +1,4 @@
-# claude-code-watchdog
+# claude-code-guardian
 
 **English** | [简体中文](README.zh.md)
 
@@ -27,8 +27,8 @@ Non-goals: it does not install or update the Claude Code CLI itself, and it does
 ```bash
 # Always clone a tag, not the default branch — the branch tip may be mid-work.
 # Latest release tag: `git ls-remote --tags <repo-url>`
-git clone --branch v0.1.0 --depth 1 <repo-url> claude-code-watchdog
-cd claude-code-watchdog/repo
+git clone --branch v0.1.0 --depth 1 <repo-url> claude-code-guardian
+cd claude-code-guardian/repo
 bash bin/claude-guardian.sh install
 ```
 

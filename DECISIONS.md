@@ -8,6 +8,35 @@ already-rejected option gets recommended again two weeks later.
 
 ---
 
+## 2026-08-16 — project renamed claude-code-watchdog → claude-code-guardian
+
+- **Context:** the project was scaffolded under the name `claude-code-watchdog`
+  (GitHub repo, local folder, doc titles), but the CLI command, systemd
+  service name, config directory (`/etc/claude-guardian`), socket path
+  (`/run/claude-guardian`), and log prefix had all already been written as
+  `claude-guardian` from the very first commit. User flagged the mismatch
+  and asked for one consistent name across code and project.
+- **Decision:** standardize on `claude-code-guardian`. Renamed the GitHub
+  repo (`gh repo rename`, which auto-updated the local `origin` remote) and
+  the local project folder
+  (`/root/MyGithub_Project/claude-code-watchdog` → `.../claude-code-guardian`),
+  and fixed the title/URL references inside README.md, DESIGN.md, and
+  STATUS.md.
+- **Rejected:** renaming the code side (CLI command, systemd unit name,
+  `/etc/claude-guardian`, `/run/claude-guardian` socket) to `watchdog`
+  instead — all of those were already live and deployed on the production
+  host at the time this was raised; renaming them would have meant
+  uninstalling and reinstalling the running service under a new name for
+  no functional benefit, versus a repo/folder rename which only touches
+  git-hosting metadata and doc text.
+- **Consequences:** the live host's systemd unit, binary path, config
+  directory, and socket path are unaffected by this change — only the
+  GitHub repo name, local folder path, and documentation titles changed.
+  Anyone with the old `claude-code-watchdog` GitHub URL will be
+  auto-redirected by GitHub's rename redirect, but should update bookmarks.
+
+---
+
 ## 2026-08-16 — always remotely controllable: --remote-control default, and unattended auto-Enter accepted as an explicit tradeoff
 
 - **Context:** user reported the original design wasn't good enough for

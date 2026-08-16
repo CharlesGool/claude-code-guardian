@@ -1,4 +1,4 @@
-# claude-code-watchdog — Design
+# claude-code-guardian — Design
 
 **English** | [简体中文](DESIGN.zh.md)
 
