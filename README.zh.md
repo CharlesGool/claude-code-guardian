@@ -27,10 +27,10 @@
 ## 安装
 
 ```bash
-# 始终克隆 tag，不要克隆可能正在开发中的默认分支。
-# 最新发布 tag：`git ls-remote --tags <repo-url>`
-git clone --branch v0.1.0 --depth 1 <repo-url> claude-code-guardian
-cd claude-code-guardian/repo
+# 目前还没有正式发布的 tag（见 CHANGELOG.md）——先克隆 main。
+# v0.1.0 发布后请改成克隆那个 tag：`git ls-remote --tags <repo-url>`
+git clone --depth 1 https://github.com/CharlesGool/claude-code-guardian.git
+cd claude-code-guardian
 bash bin/claude-guardian.sh install
 ```
 

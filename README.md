@@ -25,10 +25,10 @@ Non-goals: it does not install or update the Claude Code CLI itself, and it does
 ## Install
 
 ```bash
-# Always clone a tag, not the default branch — the branch tip may be mid-work.
-# Latest release tag: `git ls-remote --tags <repo-url>`
-git clone --branch v0.1.0 --depth 1 <repo-url> claude-code-guardian
-cd claude-code-guardian/repo
+# No tagged release yet (see CHANGELOG.md) — clone main for now.
+# Once v0.1.0 ships, clone that tag instead: `git ls-remote --tags <repo-url>`
+git clone --depth 1 https://github.com/CharlesGool/claude-code-guardian.git
+cd claude-code-guardian
 bash bin/claude-guardian.sh install
 ```
 
