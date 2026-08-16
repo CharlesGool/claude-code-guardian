@@ -1,11 +1,11 @@
 # Status — updated 2026-08-16
 
-**Version:** v0.1.0 (releasing now) · **Branch:** main
-**Notion:** not yet synced
+**Version:** v0.1.0 · **Branch:** main
+**Notion:** private mirror (not published)
 **Repo:** https://github.com/CharlesGool/claude-code-guardian (public, GPL-3.0)
-**Snapshots:** none yet
-**In progress:** cutting the v0.1.0 tag. Implementation is complete and installed live on this host (`systemctl is-active claude-guardian` → active). Core behavior: `claude --permission-mode auto --remote-control` supervised via systemd+tmux, with an unattended-only keepalive (double-Enter nudge + `/remote-control` refresh), a `purge` command for full teardown, and `install` hard-refusing if `claude auth status` reports not logged in. Independently verified working on a second host by the user. Full bug history is in DECISIONS.md — several real issues were only found via actual deployment, not code review alone.
-**Next:** after the tag: export snapshot, sync Notion, record the URL/snapshot path back here.
+**Snapshots:** maintained privately (not published)
+**In progress:** v0.1.0 released — tagged, pushed, snapshot exported, Notion synced. Core behavior: `claude --permission-mode auto --remote-control` supervised via systemd+tmux, with an unattended-only keepalive (double-Enter nudge + `/remote-control` refresh), a `purge` command for full teardown, and `install` hard-refusing if `claude auth status` reports not logged in. Independently verified working on a second host by the user. Full bug history is in DECISIONS.md — several real issues were only found via actual deployment, not code review alone.
+**Next:** nothing queued. Future work would be a v0.2+ feature or bugfix as one comes up.
 **Known issues:** none currently open.
 **Blocked on:** nothing.
 
