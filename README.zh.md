@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-> 译自 `README.md`（unreleased，对应 commit `a46c2f4`）。如有冲突，以英文版为准。
+> 译自 `README.md`（v0.1.0）。如有冲突，以英文版为准。
 
 在 Debian 服务器上，以 root 身份常驻至少一个可远程接管的 Claude Code（`claude`）会话，无论机器重启还是 `claude` 进程本身被杀（Ctrl+C、崩溃、`exit`）都能保证还有一个实例在跑。
 
