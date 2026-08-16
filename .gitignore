@@ -1,0 +1,47 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa*
+credentials*
+secrets.*
+
+# Data & logs
+# `data/` (no leading slash) matches a data directory at ANY depth — data/,
+# src/data/, tests/data/. Keep it that way.
+data/
+#
+# Seed-data exception. ONLY if the data is safe, public, and must be versioned
+# for reproducibility, uncomment all three lines below. Do NOT change the
+# `data/` line above to `data/*` — that would only match the repo root and
+# silently un-ignore every nested data directory. And do NOT stop after
+# `!/data/` — that re-includes real data too. All three, exactly as written:
+# !/data/
+# /data/*
+# !/data/seed/
+*.log
+*.sqlite
+*.db
+
+# Dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+target/
+
+# Build output
+dist/
+build/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

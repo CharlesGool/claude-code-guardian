@@ -1,0 +1,78 @@
+# claude-code-watchdog
+
+**English** | [简体中文](README.zh.md)
+
+Keeps at least one remotely-attachable Claude Code (`claude`) session alive on a Debian server, root-managed, surviving both reboots and the `claude` process itself being killed (Ctrl+C, crash, `exit`).
+
+## What it does
+
+- Installs a systemd service that supervises a dedicated `tmux` session running `claude`.
+- If `claude` exits for any reason, it is respawned automatically within a few seconds — the tmux session (and its scrollback) survives.
+- If the whole supervisor or the host reboots, systemd brings it back automatically.
+- Runs preflight checks before starting: auto-installs missing `apt` packages (`tmux` by default), verifies `claude` is on `PATH`, and warns (without blocking) if no login credentials are detected.
+- Ships an `attach` command for remote operators to take over the live session over SSH.
+
+Non-goals: it does not install or update the Claude Code CLI itself, and it does not manage multiple concurrent named sessions (see `DESIGN.md`).
+
+## Requirements
+
+- OS: Debian or a Debian-derivative with systemd (Ubuntu, etc.)
+- Must be run as root
+- `claude` already installed and reachable on `PATH` (or via `CLAUDE_BIN`) — this tool does not install it
+- Internet access for `apt-get` if `tmux` is not already installed
+
+## Install
+
+```bash
+# Always clone a tag, not the default branch — the branch tip may be mid-work.
+# Latest release tag: `git ls-remote --tags <repo-url>`
+git clone --branch v0.1.0 --depth 1 <repo-url> claude-code-watchdog
+cd claude-code-watchdog/repo
+bash bin/claude-guardian.sh install
+```
+
+`install` runs the preflight checks, writes a default config to `/etc/claude-guardian/config.env`, installs the script to `/usr/local/bin/claude-guardian`, writes and enables the systemd unit. It does not start the service — that's the next step.
+
+## Quick start
+
+```bash
+claude-guardian start
+claude-guardian attach
+```
+
+## Verify it works
+
+- `systemctl is-active claude-guardian` prints `active`.
+- `claude-guardian attach` drops you into a live `claude` terminal. Detach with the tmux prefix (default `Ctrl+b`) then `d` — **not** Ctrl+C (see gotcha below).
+- Kill `claude` from inside the session (Ctrl+C is fine to test with) — within a few seconds `claude-guardian logs` shows a `respawning automatically` line, and attaching again shows `claude` running once more.
+- `reboot` the host — after boot, `systemctl is-active claude-guardian` is `active` again without manual intervention.
+
+## Configuration
+
+| Variable | Meaning | Default | Required |
+|---|---|---|---|
+| `SESSION_NAME` | tmux session name hosting `claude` | `claude-code` | no |
+| `TMUX_SOCKET` | dedicated tmux server socket path | `/run/claude-guardian/tmux.sock` | no |
+| `WORKDIR` | working directory `claude` starts in | `/root` | no |
+| `CLAUDE_BIN` | `claude` executable name or absolute path | `claude` | no |
+| `CLAUDE_ARGS` | extra CLI args passed on every (re)start | *(empty)* | no |
+| `CHECK_INTERVAL_SEC` | seconds between liveness checks | `5` | no |
+| `REQUIRED_APT_PKGS` | space-separated apt packages auto-installed if missing | `tmux` | no |
+
+Edit `/etc/claude-guardian/config.env` and `systemctl restart claude-guardian` to apply. Full reference: see `DESIGN.md` → Configuration reference.
+
+## Other commands
+
+```bash
+claude-guardian check      # preflight report only, no changes
+claude-guardian status     # systemctl status
+claude-guardian logs       # follow the service journal
+claude-guardian stop       # stop supervision (the live tmux session is left running)
+claude-guardian uninstall  # remove the systemd service (config and session left untouched)
+```
+
+Gotcha: inside an attached session, Ctrl+C kills and immediately respawns `claude` by design (that's how a manual Ctrl+C is guaranteed to still leave an instance running) — it is not a clean way to detach. Use the tmux prefix + `d` instead.
+
+## License
+
+Private project. All rights reserved — no license granted for reuse, modification, or redistribution.
