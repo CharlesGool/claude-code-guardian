@@ -96,9 +96,16 @@ preflight_report() {
   if command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
     echo "  [ok]      $CLAUDE_BIN -> $(command -v "$CLAUDE_BIN")"
   else
-    echo "  [missing] $CLAUDE_BIN not found on PATH"
-    echo "            this tool does not install Claude Code; install it yourself first"
-    ok=1
+    local login_resolved
+    login_resolved=$(bash -ic "command -v -- '$CLAUDE_BIN'" 2>/dev/null || true)
+    if [ -n "$login_resolved" ]; then
+      echo "  [warn]    $CLAUDE_BIN not on this shell's PATH, but resolvable via an interactive login shell: $login_resolved"
+      echo "            run/install will pick this up automatically; consider setting CLAUDE_BIN to it explicitly"
+    else
+      echo "  [missing] $CLAUDE_BIN not found on PATH (current shell or interactive login shell)"
+      echo "            this tool does not install Claude Code; install it yourself first"
+      ok=1
+    fi
   fi
 
   echo "== login state (best-effort) =="
@@ -134,8 +141,27 @@ preflight_enforce() {
       || die "apt-get install failed for: ${missing[*]}"
   fi
 
-  command -v "$CLAUDE_BIN" >/dev/null 2>&1 \
-    || die "claude CLI not found (\$CLAUDE_BIN=$CLAUDE_BIN). This tool does not install Claude Code — install it first, then retry."
+  if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
+    # systemd's default PATH is minimal and commonly does NOT include where
+    # claude actually lives (e.g. ~/.local/bin), even though it resolves
+    # fine in an interactive shell. `bash -l` alone doesn't help: Debian's
+    # default ~/.bashrc returns immediately for non-interactive shells
+    # ([ -z "$PS1" ] && return), before ever reaching the PATH= line — this
+    # was verified directly, not assumed. `-i` (interactive) is what
+    # actually makes bash set $PS1 and run the rest of ~/.bashrc, so use
+    # that combination instead; stderr is discarded since -i prints
+    # terminal/job-control noise that doesn't affect the captured stdout.
+    # Self-heals configs left with the bare "claude" default. See
+    # DECISIONS.md for the deployment failure that surfaced this.
+    local login_resolved
+    login_resolved=$(bash -ic "command -v -- '$CLAUDE_BIN'" 2>/dev/null || true)
+    if [ -n "$login_resolved" ]; then
+      log "\$CLAUDE_BIN=$CLAUDE_BIN not on this shell's PATH, but resolved via an interactive login shell: $login_resolved"
+      CLAUDE_BIN="$login_resolved"
+    else
+      die "claude CLI not found (\$CLAUDE_BIN=$CLAUDE_BIN, tried both the current and a login-shell PATH). This tool does not install Claude Code — install it first, then retry, or set CLAUDE_BIN to its absolute path in $CONFIG_FILE."
+    fi
+  fi
 
   local cred_found=0
   for f in "$HOME/.claude/.credentials.json" "$HOME/.config/claude/credentials.json" "$HOME/.claude.json"; do
@@ -293,6 +319,21 @@ UNATTENDED_NUDGE_SEC="300"
 # 0 disables.
 REMOTE_CONTROL_REFRESH_SEC="1200"
 EOF
+
+  # Resolve claude to an absolute path using *this installer's* environment
+  # (a normal interactive root shell, with a full PATH) rather than leaving
+  # a bare command name in the config. systemd services run with a minimal
+  # default PATH that commonly does NOT include where `claude` actually
+  # lives (e.g. ~/.local/bin) even though it resolves fine interactively —
+  # this caused a real deployment failure (service stuck in `failed`,
+  # preflight's `command -v claude` unable to find it under systemd's PATH)
+  # on a second host during testing. See DECISIONS.md.
+  local resolved
+  resolved=$(command -v "$CLAUDE_BIN" 2>/dev/null || true)
+  if [ -n "$resolved" ]; then
+    sed -i "s|^CLAUDE_BIN=.*|CLAUDE_BIN=\"$resolved\"|" "$CONFIG_FILE"
+  fi
+
   log "wrote default config to $CONFIG_FILE"
 }
 

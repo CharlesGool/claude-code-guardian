@@ -8,6 +8,44 @@ already-rejected option gets recommended again two weeks later.
 
 ---
 
+## 2026-08-16 — resolve CLAUDE_BIN to an absolute path, don't trust systemd's PATH
+
+- **Context:** a fresh `install` on a second host succeeded, but the
+  service immediately went into `failed` state. `preflight_enforce`'s
+  `command -v "$CLAUDE_BIN"` check passed fine when run interactively
+  during `install`, but failed when systemd itself ran `claude-guardian
+  run` — systemd's default PATH
+  (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`) doesn't
+  include `~/.local/bin`, which is where `claude` lives on a typical
+  npm/pip user install. This host's own deployment happened to mask the
+  same latent bug because it has a second `claude` at `/usr/bin/claude`
+  (decoy), so it never surfaced here.
+- **Decision:** two-part fix, both verified with real functional tests
+  (not just code review): (1) `write_default_config` now resolves
+  `CLAUDE_BIN` via `command -v` at install time — using the installer's
+  own full-PATH interactive shell — and bakes the absolute path into
+  `/etc/claude-guardian/config.env`, so fresh installs never hit this. (2)
+  `preflight_enforce`/`preflight_report` fall back to resolving `claude`
+  through `bash -ic "command -v claude"` if the plain lookup fails, so
+  already-installed hosts with the bare `"claude"` default self-heal on
+  the next `run`/`check` without needing the config edited by hand.
+- **Rejected:** `bash -lc` (login, non-interactive) as the fallback
+  mechanism — tested and confirmed it does NOT work: Debian's default
+  `~/.bashrc` starts with `[ -z "$PS1" ] && return`, which fires for any
+  non-interactive invocation including `bash -l`, so it returns before
+  ever reaching the `PATH=` line. `bash -ic` (interactive) is what
+  actually gets bash to set `$PS1` and run the rest of `~/.bashrc` — this
+  was the actual, tested reason the first version of this fix wouldn't
+  have worked, not a hypothetical.
+- **Consequences:** `bash -ic` prints job-control/terminal warnings to
+  stderr in a non-tty context (harmless, discarded — verified the noise
+  never reaches the captured stdout value). Every `preflight_enforce` call
+  now potentially spawns an extra interactive shell when the fast path
+  fails, which only happens when `CLAUDE_BIN` isn't already resolvable —
+  negligible cost, and only on the failure path.
+
+---
+
 ## 2026-08-16 — open-sourced under GPL-3.0
 
 - **Context:** user asked to open-source the project under GPL-3.0.
