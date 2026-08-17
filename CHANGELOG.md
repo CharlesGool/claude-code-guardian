@@ -4,6 +4,21 @@ Newest version first. Only changes a user can perceive — internal refactors do
 not need an entry. Draft from `git log <previous-tag>..HEAD --oneline`, then
 rewrite in user-facing terms.
 
+## v0.6.0 — 2026-08-17
+
+An instance stays reachable now: a dropped Remote Control connection is
+noticed within seconds instead of up to twenty minutes. The supervisor also
+stopped answering confirmation dialogs on your behalf unless you ask it to.
+Both came out of running v0.4.0 in production for an afternoon.
+
+### Changed
+- **A dropped connection is repaired in seconds, not minutes.** The connection check now runs on every supervision tick (`REMOTE_CONTROL_CHECK_SEC`, default 5s) instead of every 20 minutes. It was always passive — one file read, nothing typed into the session — so the slow cadence bought nothing and cost up to 20 minutes of an instance being alive but unreachable from claude.ai. Reconnect attempts are rate-limited separately (`REMOTE_CONTROL_RECONNECT_BACKOFF_SEC`, default 60s), because the reconnect is the part that types.
+- **The unattended Enter is off by default.** `UNATTENDED_NUDGE_SEC` now defaults to `0`. Enter accepts whatever a confirmation dialog has highlighted, and nothing distinguishes "this session was abandoned" from "the operator is looking at that dialog right now and hasn't decided yet" — v0.4.0 narrowed that gap but could not close it, and it was seen answering a real dialog on the maintainer's behalf. Set it to a number of seconds to opt back in; the `waiting`-only rule from v0.4.0 still applies when you do.
+- **`REMOTE_CONTROL_REFRESH_SEC` was replaced** by `REMOTE_CONTROL_CHECK_SEC` + `REMOTE_CONTROL_RECONNECT_BACKOFF_SEC`. A config still setting the old name logs a warning at startup and is otherwise ignored — delete that line from `/etc/claude-guardian/config.env`.
+
+### Fixed
+- The stored remote-control URL is only rewritten when it actually changes, so `remote_url_updated_at` still means "when this URL was established" instead of becoming a five-second heartbeat.
+
 ## v0.5.0 — 2026-08-17
 
 The `claude-session` Agent Skill now ships with the tool.

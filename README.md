@@ -10,11 +10,8 @@ Keeps one or more named, remotely-attachable Claude Code (`claude`) sessions ali
 - Knows each instance's current `claude.ai/code/...` remote-control URL — `claude-guardian url <name>` or `claude-guardian list` prints it without ever attaching. The point: create, discover, and reach a session entirely from another device, no terminal required. Fetch it when you need it rather than bookmarking it: the URL changes whenever Remote Control reconnects.
 - If `claude` exits for any reason, it is respawned automatically within a few seconds, continuing the same conversation — the tmux session (and its scrollback) survives.
 - If the whole supervisor or the host reboots, every instance that was `activate`d comes back automatically — **on the conversation it was having before**, not an empty one. A reboot takes the tmux server with it, so the session is rebuilt from scratch; the instance's conversation is picked back up with `claude --resume` when its transcript is still on disk (`RESUME_AFTER_RESTART=0` opts out). A conversation that can no longer be resumed falls back to a new one rather than leaving the instance stuck.
-- While nobody is attached to an instance, watches it so it can't go silently stuck or unreachable — reading Claude Code's own session file, so a healthy instance is never typed into:
-  - If it has been parked on a confirmation dialog for `UNATTENDED_NUDGE_SEC` with nobody there to answer it, sends Enter to clear it. A session that is working, or waiting at an empty prompt, is left alone — including one somebody is driving from claude.ai, which has no attached tmux client and would otherwise look abandoned.
-  - Checks that Remote Control is still connected, reconnecting it and picking up the new URL if it has dropped.
-
-  See `DESIGN.md` → Known limitations for the tradeoffs this involves.
+- **Keeps every instance continuously reachable.** Remote Control drops on its own — a server-side timeout, a network blip — and nothing announces it: the session keeps working, it just stops being reachable from claude.ai. Every supervision tick (`REMOTE_CONTROL_CHECK_SEC`, default 5s) the supervisor reads Claude Code's own session file to see whether the connection is still up, and reconnects the moment it isn't, picking up the new URL. The check types nothing into the session; only an actual reconnect does, and that is rate-limited by `REMOTE_CONTROL_RECONNECT_BACKOFF_SEC` (default 60s) so an instance that cannot reconnect is never typed into on a loop.
+- **Never answers a confirmation dialog for you, by default.** A session parked on a permission prompt can be unstuck by sending Enter — but Enter accepts whatever the dialog has highlighted, which means deciding on your behalf, and from outside there is no way to tell "abandoned" from "you simply haven't answered it yet". So `UNATTENDED_NUDGE_SEC` defaults to `0` (off) since v0.6.0. Set it to a number of seconds if you would rather have an unattended instance unstick itself; it then only ever types into a session Claude Code itself reports as parked on a dialog, never one that is working or idle. See `DESIGN.md` → Known limitations.
 - Lets you **pause** an instance (`deactivate`/`activate`: stop/resume supervision, tmux session left running) independently of **archiving** it (`archive`/`resume`: save scrollback + conversation id, then kill the process; pick the conversation back up later with `claude --resume`).
 - Runs preflight checks: auto-installs missing `apt` packages (`tmux`, `uuid-runtime` by default), verifies `claude` is on `PATH`. `install`/`new` refuse to proceed if `claude` isn't logged in yet (checked via `claude auth status`); once running, `run` only warns on login state so an instance that later loses auth keeps retrying instead of failing to start.
 - Ships an `attach` command for remote operators to take over a live session over SSH, as an alternative to the claude.ai remote-control URL.
@@ -35,7 +32,7 @@ Non-goals: it does not install or update the Claude Code CLI itself, and it does
 ```bash
 # Clone a tag, not the branch tip — the tip can be mid-change.
 # List available tags: git ls-remote --tags <repo-url>
-git clone --depth 1 --branch v0.4.0 https://github.com/CharlesGool/claude-code-guardian.git
+git clone --depth 1 --branch v0.6.0 https://github.com/CharlesGool/claude-code-guardian.git
 cd claude-code-guardian
 bash bin/claude-guardian.sh install
 ```
@@ -74,6 +71,7 @@ claude-guardian url work      # print just the claude.ai URL — no attach neede
 - Actually exit `claude` from inside the session (press Ctrl+C **twice** in quick succession, or type `/exit` — a single Ctrl+C only interrupts the current turn, it does not exit) — within a few seconds `claude-guardian logs` shows a `respawning automatically` line, and attaching again shows `claude` running once more, same conversation.
 - `claude-guardian deactivate` — `claude` keeps running (only pauses supervision and disables restart-on-boot, see gotcha below); `claude-guardian activate` resumes watching it without restarting it.
 - `claude-guardian archive claude-code --yes` then `claude-guardian resume claude-code` — the instance disappears from `list`, shows up in `archives`, and comes back with the same conversation continued (`claude --resume`).
+- Disconnect Remote Control from inside a session (`/remote-control` → `Disconnect this session`) and detach — within `REMOTE_CONTROL_CHECK_SEC` (5s by default) `claude-guardian logs <name>` shows `remote control disconnected ... reconnecting` followed by a URL, and `claude-guardian url <name>` prints that new URL. While the connection is healthy the log stays silent, which is the point: nothing is typed into a session that does not need it.
 - `reboot` the host — after boot, every instance that was `activate`d is `active` again without manual intervention, and `claude-guardian logs <name>` shows a `continuing this instance's previous conversation` line. Attach: the conversation from before the reboot is still there. (Without a reboot: `claude-guardian stop <name>`, kill its tmux session with `tmux -S /run/claude-guardian/tmux.sock kill-session -t <name>`, then `claude-guardian start <name>` — same result.)
 
 ## Configuration
@@ -88,8 +86,9 @@ Global defaults live in `/etc/claude-guardian/config.env`. Per-instance override
 | `CLAUDE_ARGS` | extra CLI args passed on every (re)start | `--permission-mode auto --remote-control` | global / per-instance |
 | `CHECK_INTERVAL_SEC` | seconds between liveness checks | `5` | global |
 | `REQUIRED_APT_PKGS` | space-separated apt packages auto-installed if missing | `tmux uuid-runtime` | global |
-| `UNATTENDED_NUDGE_SEC` | unattended-only: send Enter once a confirmation dialog has been unanswered this long (`0` disables). Nothing is sent to a session that is working or at a prompt | `300` | global |
-| `REMOTE_CONTROL_REFRESH_SEC` | unattended-only: seconds between checks that Remote Control is still connected, reconnecting it if not (`0` disables) | `1200` | global |
+| `UNATTENDED_NUDGE_SEC` | unattended-only: send Enter once a confirmation dialog has been unanswered this long, answering it on your behalf. `0` = never (default). Nothing is ever sent to a session that is working or at a prompt | `0` | global |
+| `REMOTE_CONTROL_CHECK_SEC` | unattended-only: seconds between connection checks; the check is passive and types nothing, so this can be as low as the tick interval (`0` disables) | `5` | global |
+| `REMOTE_CONTROL_RECONNECT_BACKOFF_SEC` | minimum seconds between two reconnect attempts — the reconnect is the part that types `/remote-control` into the session | `60` | global |
 | `CLAUDE_SESSIONS_DIR` | where Claude Code writes its per-session JSON files; read-only, and what the connected/disconnected and busy/idle/waiting checks read | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions` | global |
 | `CLAUDE_PROJECTS_DIR` | where Claude Code keeps conversation transcripts; read-only, checked before resuming a conversation after a restart | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects` | global |
 | `RESUME_AFTER_RESTART` | `1`: bring an instance back on its previous conversation after a reboot. `0`: always start a new one | `1` | global / per-instance |

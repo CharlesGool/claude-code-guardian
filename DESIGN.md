@@ -31,10 +31,12 @@
   OOM kill — by automatically restarting it within seconds, without losing
   the surrounding session.
 - Stay actually reachable through long unattended stretches, not just
-  "process is running": periodically clear confirmation prompts `auto`
-  permission mode may fall back to, and proactively refresh the Remote
-  Control connection before it can go stale (see Known limitations for the
-  safety tradeoff this implies).
+  "process is running": notice a dropped Remote Control connection within
+  seconds and repair it, so an instance is never alive-but-unreachable for
+  longer than a tick. Clearing a confirmation prompt `auto` permission mode
+  fell back to is available too, but off by default — answering a prompt is
+  a decision, and this tool's job stops at keeping the session reachable
+  (see Known limitations).
 - Run preflight checks: required `apt` packages present (auto-install if
   missing), `claude` binary present (hard requirement, never
   auto-installed). Login state is checked via `claude auth status`
@@ -82,11 +84,11 @@ one systemd unit instance and one tmux session per `claude-guardian
    claude-guardian@<name>.service    |
    (one instance per name,           | every CHECK_INTERVAL_SEC:
     from a template unit)            | tmux has-session? / pane_dead? / client attached?
-                                      | (if unattended: clear a dialog nobody
-                                      |  answered / check that Remote Control
-                                      |  is still connected and reconnect it
-                                      |  if not — on their own longer
-                                      |  intervals, see below)
+                                      | (if unattended: check every tick that
+                                      |  Remote Control is still connected and
+                                      |  reconnect it if not; optionally, and
+                                      |  off by default, clear a dialog nobody
+                                      |  answered — see below)
                                       v
                      tmux session "<name>" (remain-on-exit on)
                      — one of possibly several, all on the same
@@ -159,20 +161,30 @@ one systemd unit instance and one tmux session per `claude-guardian
   with a new conversation.
 - **unattended keepalive** (see `DECISIONS.md` 2026-08-16 "always remotely
   controllable"): when `tmux list-clients` shows nobody attached to an
-  instance's session, its loop periodically (a) sends Enter — twice, one
-  second apart — to clear a confirmation dialog nobody has answered, and
-  (b) checks that Remote Control is still connected, reconnecting it if it
-  isn't. Both stop immediately once a client attaches (checked every tick).
-  "Nobody attached" is necessary but not sufficient for (a): the loop also
-  asks `claude` what the session is doing, and only types into one that is
-  actually parked on a dialog — see **when the nudge is allowed to type**
-  below. `create_session`
-  sends the same double Enter right after starting `claude`, for the same
-  reason: a genuinely first-ever run can show an onboarding/trust screen
-  that needs two Enters to clear, and that shouldn't have to wait for the
-  first unattended-nudge interval to pass — then records the URL once
+  instance's session, its loop (a) checks that Remote Control is still
+  connected and reconnects it if it isn't, and (b) — only if the operator
+  opted in by setting `UNATTENDED_NUDGE_SEC` above `0` — sends Enter, twice
+  one second apart, to clear a confirmation dialog nobody has answered.
+  Both stop immediately once a client attaches (checked every tick).
+  The two run on very different clocks, and v0.6.0 separated them for a
+  reason (see `DECISIONS.md`, 2026-08-17 "watch the connection on every
+  tick"): (a) is passive — it reads a file and types nothing — so it runs
+  every `REMOTE_CONTROL_CHECK_SEC` (default 5s, i.e. every tick), because a
+  dropped connection is invisible from claude.ai and every second of it is
+  a second the operator cannot reach a session that is otherwise fine. Only
+  the reconnect types, and it is rate-limited separately by
+  `REMOTE_CONTROL_RECONNECT_BACKOFF_SEC` (default 60s). (b) types by
+  definition, decides on the operator's behalf, and is therefore off by
+  default. "Nobody attached" is necessary but not sufficient for it: the
+  loop also asks `claude` what the session is doing, and only types into
+  one that is actually parked on a dialog — see **when the nudge is allowed
+  to type** below. `create_session`
+  sends the same double Enter right after starting `claude`, regardless of
+  that setting: a genuinely first-ever run can show an onboarding/trust
+  screen that needs two Enters to clear, and no conversation content exists
+  yet for an Enter to affect — then records the URL once
   synchronously, so `new` can print it immediately instead of waiting up to
-  `REMOTE_CONTROL_REFRESH_SEC`. A second Enter once `claude` is already
+  `REMOTE_CONTROL_CHECK_SEC`. A second Enter once `claude` is already
   sitting at its normal prompt is a harmless no-op either way, so there's
   no downside to always sending two instead of trying to detect which
   screen is showing.
@@ -198,10 +210,13 @@ one systemd unit instance and one tmux session per `claude-guardian
   **Re-running `/remote-control` on a session that still believes it is
   connected refreshes nothing** — that mistaken assumption was the whole
   basis of the v0.2.0 keepalive, and is why this checks before acting.
-- **when the nudge is allowed to type** (see `DECISIONS.md`, 2026-08-17
-  "nudge only a session that is actually parked"): the same session file
-  carries a `status` field, and the loop nudges on that rather than on the
-  wall clock. Three values, all three observed live on 2.1.202: `busy`
+- **when the nudge is allowed to type at all** (see `DECISIONS.md`,
+  2026-08-17 "nudge only a session that is actually parked" and "stop
+  answering dialogs by default"): first, only when the operator has turned
+  it on — `UNATTENDED_NUDGE_SEC` defaults to `0`, and at `0` no Enter is
+  ever sent to a running session, full stop. When it is turned on, the same
+  session file carries a `status` field, and the loop nudges on that rather
+  than on the wall clock. Three values, all three observed live on 2.1.202: `busy`
   (mid-turn), `idle` (sitting at an empty prompt), and `waiting` (parked on
   a confirmation dialog). Only `waiting` justifies sending Enter, and only
   once it has held that status for `UNATTENDED_NUDGE_SEC` — read from
@@ -296,8 +311,9 @@ Global variables live in `/etc/claude-guardian/config.env`, a plain `KEY="value"
 | `CLAUDE_ARGS` | extra CLI args passed on every (re)start | `--permission-mode auto --remote-control` | global, overridable per instance | no |
 | `CHECK_INTERVAL_SEC` | seconds between liveness checks | `5` | global | no |
 | `REQUIRED_APT_PKGS` | space-separated apt packages auto-installed if missing | `tmux uuid-runtime` | global | no |
-| `UNATTENDED_NUDGE_SEC` | unattended-only: how long a confirmation dialog may sit unanswered, with no tmux client attached, before a bare Enter is sent to clear it; `0` disables. A session that is working or at an empty prompt is never typed into | `300` | global | no |
-| `REMOTE_CONTROL_REFRESH_SEC` | unattended-only: seconds between checks that Remote Control is still connected (reconnecting if not, and refreshing the stored URL either way); `0` disables | `1200` | global | no |
+| `UNATTENDED_NUDGE_SEC` | unattended-only: how long a confirmation dialog may sit unanswered, with no tmux client attached, before a bare Enter answers it on the operator's behalf; `0` (the default) never sends one. A session that is working or at an empty prompt is never typed into either way | `0` | global | no |
+| `REMOTE_CONTROL_CHECK_SEC` | unattended-only: seconds between connection checks. The check is passive — it reads the session file and types nothing — so the default is one check per supervision tick; `0` disables | `5` | global | no |
+| `REMOTE_CONTROL_RECONNECT_BACKOFF_SEC` | minimum seconds between two reconnect attempts for one instance. The reconnect is the only part that types (`/remote-control`), so this bounds how often an instance that cannot reconnect is typed into | `60` | global | no |
 | `CLAUDE_SESSIONS_DIR` | where Claude Code writes its per-session JSON files; read-only, and what makes the connected/disconnected and busy/idle/waiting checks possible | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions` | global | no |
 | `CLAUDE_PROJECTS_DIR` | where Claude Code keeps conversation transcripts; read-only, checked before resuming a conversation after a restart | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects` | global | no |
 | `RESUME_AFTER_RESTART` | `1`: after a restart that took the tmux session with it, bring the instance back on the conversation it already had; `0`: always start a new one | `1` | global, overridable per instance | no |
@@ -315,8 +331,9 @@ Global variables live in `/etc/claude-guardian/config.env`, a plain `KEY="value"
 8. `claude-guardian deactivate second-instance` then check `pgrep -f 'claude --permission-mode'` — verify: both `claude` processes are still running (deactivate only pauses supervision, see Known limitations on `KillMode`). `claude-guardian activate second-instance` again — verify: the same `claude` PID for that instance is still there (supervision resumes against the existing session instead of recreating it).
 9. `claude-guardian archive second-instance --yes` — verify: `claude-guardian list` no longer shows `second-instance`; `claude-guardian archives` shows one entry for it with a saved `scrollback.txt`; `pgrep -f 'claude --permission-mode'` shows only the `claude-code` process remains.
 10. `claude-guardian resume second-instance` (or the exact archive id from step 9) — verify: `claude-guardian list` shows `second-instance` again, and `claude-guardian attach second-instance` continues the same conversation instead of starting fresh.
-11. Detach from `claude-code` and leave it unattended for longer than `UNATTENDED_NUDGE_SEC` with nothing in progress — verify: `claude-guardian logs claude-code` shows **no** `sending Enter` line, because an idle prompt has nothing to clear. Then trigger a confirmation dialog (easiest with `--permission-mode default`: ask it to run any shell command), detach, and leave it — verify: at the `UNATTENDED_NUDGE_SEC` mark the log shows `has been waiting on a confirmation for Ns with nobody attached` followed by `sending Enter`, and the dialog is gone. Reattach and detach once more — verify it does not fire again immediately (timers reset on attach). The Remote Control check at `REMOTE_CONTROL_REFRESH_SEC` is deliberately silent while the connection is healthy; to see it work, disconnect Remote Control from inside the session (`/remote-control` → `Disconnect this session`) and verify that within `REMOTE_CONTROL_REFRESH_SEC` the log shows `remote control disconnected ... reconnecting` followed by a *new* URL, and that `claude-guardian url claude-code` prints that new URL.
-12. `reboot` the host — verify: after boot, every instance that was `activate`d (not `deactivate`d) is `active` again without manual intervention, `claude-guardian logs <name>` shows `continuing this instance's previous conversation (<uuid>)`, and attaching shows the conversation from before the reboot rather than an empty one. To rehearse this without rebooting: `claude-guardian stop <name>`, `tmux -S /run/claude-guardian/tmux.sock kill-session -t <name>`, `claude-guardian start <name>`.
+11. Disconnect Remote Control from inside the session (`/remote-control` → `Disconnect this session`) and detach — verify: within `REMOTE_CONTROL_CHECK_SEC` (5s by default) `claude-guardian logs claude-code` shows `remote control disconnected ... reconnecting` followed by a *new* URL, and `claude-guardian url claude-code` prints that new URL. Leave the instance connected and detached for several minutes afterwards — verify the log stays completely silent, i.e. checking every tick costs nothing visible and types nothing. To exercise the reconnect backoff, disconnect and then immediately break reconnection (e.g. take the network down): the `reconnecting` line must appear at most once per `REMOTE_CONTROL_RECONNECT_BACKOFF_SEC`, not once per tick.
+12. With the default `UNATTENDED_NUDGE_SEC=0`: trigger a confirmation dialog (easiest with `--permission-mode default`: ask it to run any shell command), detach, and leave it for several minutes — verify: `claude-guardian logs claude-code` never shows a `sending Enter` line and the dialog is still waiting when you come back. Nothing answers it for you. Then set `UNATTENDED_NUDGE_SEC="60"` in `/etc/claude-guardian/config.env`, `claude-guardian restart claude-code`, and repeat — verify: at the 60s mark the log shows `has been waiting on a confirmation for Ns with nobody attached` followed by `sending Enter`, and the dialog is gone. Reattach and detach once more — verify it does not fire again immediately (timers reset on attach). Set it back to `0` afterwards.
+13. `reboot` the host — verify: after boot, every instance that was `activate`d (not `deactivate`d) is `active` again without manual intervention, `claude-guardian logs <name>` shows `continuing this instance's previous conversation (<uuid>)`, and attaching shows the conversation from before the reboot rather than an empty one. To rehearse this without rebooting: `claude-guardian stop <name>`, `tmux -S /run/claude-guardian/tmux.sock kill-session -t <name>`, `claude-guardian start <name>`.
 
 This project is not deployed with Docker; steps above are the full deployment procedure.
 
@@ -339,8 +356,11 @@ sufficient, without needing the rest of the repo.
 
 ## Known limitations & gotchas
 
-- **`UNATTENDED_NUDGE_SEC` (auto-Enter) is a deliberate, explicitly-approved
-  safety tradeoff, not a neutral convenience feature.** `--permission-mode
+- **`UNATTENDED_NUDGE_SEC` (auto-Enter) is off by default since v0.6.0, and
+  turning it on is a deliberate safety tradeoff, not a neutral convenience
+  feature.** Everything below describes what you are opting into; at the
+  default `0` none of it happens and a confirmation dialog simply waits
+  until a human answers it. `--permission-mode
   auto` falls back to an interactive confirmation after the classifier
   blocks 3 actions in a row (or 20 total) — that fallback exists so a human
   makes the call on something the classifier couldn't clear automatically.
@@ -355,14 +375,19 @@ sufficient, without needing the rest of the repo.
   documented alternative is `--permission-mode dontAsk` with an explicit
   `permissions.allow` list, which denies unlisted actions silently instead
   of guessing at a confirmation dialog (more predictable, more setup work).
-  What v0.4.0 narrows is only *who* it can happen to: the Enter now goes
-  only to a session `claude` itself reports as `waiting`, and only after
-  the dialog has gone unanswered for the full interval, so a session
-  somebody is working in is no longer typed into. The residual case is a
-  human on claude.ai who opens a dialog and then leaves it for longer than
-  `UNATTENDED_NUDGE_SEC` while still intending to answer it — from the
-  outside that is indistinguishable from an abandoned session, and it will
-  be answered on their behalf. Raise the interval if that matters.
+  v0.4.0 narrowed *who* it can happen to — the Enter goes only to a session
+  `claude` itself reports as `waiting`, and only after the dialog has gone
+  unanswered for the full interval, so a session somebody is working in is
+  not typed into. What that could not fix is the residual case: a human on
+  claude.ai who opens a dialog and then leaves it longer than
+  `UNATTENDED_NUDGE_SEC` while still intending to answer it is
+  indistinguishable, from the outside, from an abandoned session — and it
+  was observed happening in production the day v0.4.0 shipped. There is no
+  signal that separates the two, so v0.6.0 stopped trying: the feature is
+  off unless the operator turns it on, and the loop then holds the same
+  `waiting`-only rule. Whoever turns it on is choosing "an abandoned
+  instance unsticks itself" over "nobody but me ever answers a permission
+  prompt".
 - **`claude-guardian install`/`new` auto-install missing apt packages
   non-interactively** (`DEBIAN_FRONTEND=noninteractive apt-get install -y`).
   By default this is `tmux` and `uuid-runtime`. If you widen
@@ -494,16 +519,26 @@ sufficient, without needing the rest of the repo.
   refusing to start. This is deliberate, not an oversight: a service that
   was working and later loses auth (expired token, revoked session) should
   keep trying to serve, not go into a restart-fail loop.
-- **`REMOTE_CONTROL_REFRESH_SEC`'s 1200s default bounds how long a dropped
-  connection can go unnoticed, and nothing more.** v0.2.0 chose 20 minutes
-  to stay inside Anthropic's documented ~30-minute "could not reach the
-  Remote Control server" window, on the assumption that re-running
-  `/remote-control` beforehand would keep the connection from ever
-  expiring. That assumption was wrong (see `DECISIONS.md`, 2026-08-17), so
-  the number now means something much simpler: a disconnect is detected and
-  repaired within at most this many seconds. Lowering it shortens the
-  outage; the check is a single file read, so it is cheap to lower.
-- **The unattended-nudge/refresh timers only start counting from when the
+- **`REMOTE_CONTROL_CHECK_SEC` bounds how long a dropped connection can go
+  unnoticed, and nothing more.** v0.2.0 set this to 1200s to stay inside
+  Anthropic's documented ~30-minute "could not reach the Remote Control
+  server" window, on the assumption that re-running `/remote-control`
+  beforehand would keep the connection from ever expiring. That assumption
+  was wrong (see `DECISIONS.md`, 2026-08-17), which left a 20-minute number
+  doing a job it was never chosen for: it had become "how long an instance
+  can sit unreachable", and in production it did exactly that. Since v0.6.0
+  the check runs every tick (5s) — it is a single file read that types
+  nothing, so there was never a reason for it to be slow — and the old
+  variable is gone. A config still setting `REMOTE_CONTROL_REFRESH_SEC`
+  gets a warning at loop start; the setting itself is ignored.
+- **A reconnect that keeps failing is retried on a backoff, not on every
+  check.** `REMOTE_CONTROL_RECONNECT_BACKOFF_SEC` (60s) exists because the
+  reconnect is the one step that types into the session: without it, an
+  instance whose Remote Control cannot come back would get `/remote-control`
+  typed into it every 5 seconds. When `claude` writes no usable session file
+  at all, nothing can ever confirm success, so that case falls back to a
+  much slower internal retry (1200s) instead of the 60s backoff.
+- **The unattended-nudge/connection timers only start counting from when the
   supervision loop itself (re)starts, not from whenever the session was
   actually last attended.** This was a real bug caught live: the first
   version initialized both timers to `0` (epoch), so any `systemctl

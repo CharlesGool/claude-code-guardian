@@ -79,14 +79,27 @@ CHECK_INTERVAL_SEC="5"
 REQUIRED_APT_PKGS="tmux uuid-runtime"
 # When no tmux client is attached and claude has been parked on a
 # confirmation dialog for this many seconds, send a bare Enter keystroke to
-# clear it. Nothing is ever sent to a session that is working or sitting at
-# a prompt. 0 disables. See DESIGN.md Known limitations.
-UNATTENDED_NUDGE_SEC="300"
-# How often to check that Remote Control is still connected, and reconnect
-# it if it isn't. The check itself is passive (it reads claude's own session
-# file, see CLAUDE_SESSIONS_DIR) and types nothing into the session; only an
-# actual reconnect sends /remote-control. 0 disables.
-REMOTE_CONTROL_REFRESH_SEC="1200"
+# clear it. Enter accepts whatever the dialog has highlighted, so this
+# answers a permission prompt on the operator's behalf — which is why it is
+# off by default since v0.6.0. 0 disables. See DESIGN.md Known limitations.
+UNATTENDED_NUDGE_SEC="0"
+# How often to check that Remote Control is still connected. The check is
+# passive — it reads claude's own session file (see CLAUDE_SESSIONS_DIR) and
+# types nothing into the session — so it is cheap enough to run on every
+# supervision tick, which is what keeps an instance continuously reachable.
+# 0 disables.
+REMOTE_CONTROL_CHECK_SEC="5"
+# Minimum seconds between two reconnect attempts for the same instance. Only
+# the reconnect types into the session (`/remote-control`), so this is what
+# stops a session that cannot reconnect from being typed into every few
+# seconds.
+REMOTE_CONTROL_RECONNECT_BACKOFF_SEC="60"
+# Same idea, but for the case where claude writes no usable session file at
+# all: nothing will ever confirm that a reconnect worked, so the fast path
+# would type /remote-control into the session forever. Deliberately not
+# written into the generated config — a host that needs to tune this has a
+# bigger problem to fix first.
+NO_SESSION_FILE_RETRY_SEC="1200"
 # Claude Code writes one JSON file per running session here, named after that
 # session's PID, with a "bridgeSessionId" field holding the Remote Control
 # session id while connected (null once disconnected). That file is the
@@ -394,7 +407,7 @@ create_session() {
 
   # Best-effort: record the remote-control URL right away so `new` can print
   # it immediately instead of waiting for the first periodic check (up to
-  # REMOTE_CONTROL_REFRESH_SEC later). claude was started with
+  # REMOTE_CONTROL_CHECK_SEC later). claude was started with
   # --remote-control, so this normally just reads its session file and types
   # nothing. It can still fall through to sending /remote-control if that
   # file has not appeared yet — and if claude is meanwhile still
@@ -527,6 +540,16 @@ store_remote_url() {
   state_set "$name" remote_url_updated_at "$(date -Iseconds)"
 }
 
+# Same, but a no-op when the URL has not changed. The connection check runs
+# on every tick now, and rewriting two state lines every few seconds for a
+# URL that is still the same one would be pointless disk churn — and would
+# turn remote_url_updated_at into a heartbeat instead of what it says it is.
+store_remote_url_if_changed() {
+  local name="$1" url="$2"
+  [ "$(state_get "$name" remote_url)" = "$url" ] && return 0
+  store_remote_url "$name" "$url"
+}
+
 # Records the instance's Remote Control URL, turning Remote Control back on
 # first if it is off. Typing into the session is the last resort here, not
 # the first move: claude is started with --remote-control, so on a healthy
@@ -580,16 +603,27 @@ capture_remote_control_url() {
 # network goes away — and nothing announces that in the terminal, so the
 # only way to know is to look. Re-running /remote-control on a session that
 # still believes it is connected does NOT re-establish anything; it just
-# opens the informational dialog. That is why this checks first (passively,
-# typing nothing) and only sends keys when genuinely disconnected.
-refresh_remote_control() {
+# opens the informational dialog. That is why the loop asks this first
+# (passively, typing nothing) and only sends keys when genuinely
+# disconnected.
+#
+# Returns, and the distinction matters because the two cases deserve very
+# different retry rates:
+#   0 — connected; the URL is recorded if it changed
+#   1 — claude's own session file says disconnected (bridgeSessionId null),
+#       so a reconnect is both possible and worth doing right away
+#   2 — no usable session file for this instance at all (a Claude Code that
+#       writes none, or one that cannot be trusted to be this instance's).
+#       Retrying every minute here would type /remote-control into the
+#       session forever, since nothing will ever confirm success.
+connection_state() {
   local name="$1" url
   if url=$(bridge_url_of "$name"); then
-    store_remote_url "$name" "$url"
+    store_remote_url_if_changed "$name" "$url"
     return 0
   fi
-  log "remote control disconnected for '$name' — reconnecting"
-  capture_remote_control_url "$name"
+  session_json_of "$name" >/dev/null 2>&1 || return 2
+  return 1
 }
 
 supervise_loop() {
@@ -604,22 +638,30 @@ supervise_loop() {
   # that's already alive and unattended when the loop (re)starts (e.g. a
   # systemd restart, or a reboot) triggers an immediate nudge/refresh
   # instead of waiting out the configured interval first.
-  local last_nudge last_refresh
+  local last_nudge last_check last_reconnect
   last_nudge=$(date +%s)
-  last_refresh=$(date +%s)
+  last_check=$(date +%s)
+  last_reconnect=$(date +%s)
+
+  if [ -n "${REMOTE_CONTROL_REFRESH_SEC:-}" ]; then
+    log "warning: REMOTE_CONTROL_REFRESH_SEC is set but was replaced in v0.6.0 by REMOTE_CONTROL_CHECK_SEC (how often to check, default 5s) and REMOTE_CONTROL_RECONNECT_BACKOFF_SEC (how often a reconnect may be retried, default 60s) — the old setting is ignored; remove it from $CONFIG_FILE"
+  fi
 
   while [ "$stop" -eq 0 ]; do
     if ! session_exists "$name"; then
       create_session "$name"
       last_nudge=$(date +%s)
-      last_refresh=$(date +%s)
+      last_check=$(date +%s)
+      last_reconnect=$(date +%s)
     elif pane_is_dead "$name"; then
       respawn_pane "$name"
     elif has_attached_client "$name"; then
-      # someone is live in the session — never nudge/refresh while attended,
-      # and reset the timers so a nudge doesn't fire right after they leave
+      # someone is live in the session — never nudge or type a reconnect
+      # while attended, and reset the timers so neither fires the instant
+      # they leave
       last_nudge=$(date +%s)
-      last_refresh=$(date +%s)
+      last_check=$(date +%s)
+      last_reconnect=$(date +%s)
     else
       local now
       now=$(date +%s)
@@ -651,9 +693,27 @@ supervise_loop() {
           last_nudge=$now
         fi
       fi
-      if [ "$REMOTE_CONTROL_REFRESH_SEC" -gt 0 ] && [ $(( now - last_refresh )) -ge "$REMOTE_CONTROL_REFRESH_SEC" ]; then
-        refresh_remote_control "$name"
-        last_refresh=$now
+      if [ "$REMOTE_CONTROL_CHECK_SEC" -gt 0 ] && [ $(( now - last_check )) -ge "$REMOTE_CONTROL_CHECK_SEC" ]; then
+        last_check=$now
+        local cstate=0 backoff
+        connection_state "$name" || cstate=$?
+        if [ "$cstate" -ne 0 ]; then
+          # A dropped connection is the one failure the operator cannot see
+          # from claude.ai — the session is alive and working, it just isn't
+          # reachable — so it is reconnected as soon as it is noticed, not on
+          # a slow timer. The backoff only limits how often keys are sent.
+          backoff="$REMOTE_CONTROL_RECONNECT_BACKOFF_SEC"
+          [ "$cstate" -eq 2 ] && backoff="$NO_SESSION_FILE_RETRY_SEC"
+          if [ $(( now - last_reconnect )) -ge "$backoff" ]; then
+            last_reconnect=$now
+            if [ "$cstate" -eq 2 ]; then
+              log "no usable session file for '$name' — retrying /remote-control on the slow path (every ${backoff}s)"
+            else
+              log "remote control disconnected for '$name' — reconnecting"
+            fi
+            capture_remote_control_url "$name" || true
+          fi
+        fi
       fi
     fi
     sleep "$CHECK_INTERVAL_SEC" &
@@ -706,17 +766,24 @@ REQUIRED_APT_PKGS="tmux uuid-runtime"
 
 # when no tmux client is attached and claude has been parked on a
 # confirmation dialog for this many seconds, send a bare Enter to clear it.
-# A session that is working, or waiting at an empty prompt, is never typed
-# into — including one being driven from claude.ai, which no tmux client
-# can show. 0 disables.
-UNATTENDED_NUDGE_SEC="300"
+# Enter accepts whatever the dialog has highlighted, so this answers a
+# permission prompt for you — including one you opened yourself from
+# claude.ai and simply have not answered yet, which no tmux client can show.
+# Off by default. Set a number of seconds only if you would rather have an
+# abandoned session unstick itself than keep that decision.
+UNATTENDED_NUDGE_SEC="0"
 
-# how often to check that Remote Control is still connected and reconnect it
-# if it isn't, refreshing the stored claude.ai URL either way (see
+# how often to check that Remote Control is still connected, reconnecting it
+# and picking up the new claude.ai URL if it has dropped (see
 # `claude-guardian url <name>`). The check reads claude's own session file
-# and types nothing into the session; only a real reconnect sends keys.
-# 0 disables.
-REMOTE_CONTROL_REFRESH_SEC="1200"
+# and types nothing into the session, so checking every tick is cheap; it is
+# what keeps an instance continuously reachable. 0 disables.
+REMOTE_CONTROL_CHECK_SEC="5"
+
+# minimum seconds between two reconnect attempts for the same instance. Only
+# the reconnect itself types into the session, so this is the knob that keeps
+# an instance that cannot reconnect from being typed into every few seconds.
+REMOTE_CONTROL_RECONNECT_BACKOFF_SEC="60"
 
 # where Claude Code writes its per-session JSON files, one per running
 # session, named after that session's PID. Read-only; it is what makes the
@@ -937,9 +1004,9 @@ cmd_url() {
     echo "$url"
     local ts
     ts=$(state_get "$name" remote_url_updated_at)
-    log "warning: remote control is not connected for '$name' right now, so this link is probably dead${ts:+ (last verified $ts)}. The supervisor reconnects within ${REMOTE_CONTROL_REFRESH_SEC}s and the new link will show up here; follow it with '$PROG_NAME logs $name'."
+    log "warning: remote control is not connected for '$name' right now, so this link is probably dead${ts:+ (URL last changed $ts)}. The supervisor notices within ${REMOTE_CONTROL_CHECK_SEC}s and reconnects (retried at most every ${REMOTE_CONTROL_RECONNECT_BACKOFF_SEC}s); the new link will show up here — follow it with '$PROG_NAME logs $name'."
   else
-    die "no URL known yet for '$name'. It's recorded on creation and re-checked every ${REMOTE_CONTROL_REFRESH_SEC}s; check '$PROG_NAME logs $name', or attach and run /remote-control yourself."
+    die "no URL known yet for '$name'. It's recorded on creation and re-checked every ${REMOTE_CONTROL_CHECK_SEC}s; check '$PROG_NAME logs $name', or attach and run /remote-control yourself."
   fi
 }
 

@@ -8,6 +8,58 @@ already-rejected option gets recommended again two weeks later.
 
 ---
 
+## 2026-08-17 — watch the connection on every tick, and stop answering dialogs by default
+
+- **Context:** within an hour of v0.4.0 going live with three instances, the
+  operator reported "怎么其他两个会话都disconnected了". Both were genuinely
+  disconnected (`bridgeSessionId: null`) and both were working fine
+  otherwise — alive, mid-conversation, simply unreachable from claude.ai.
+  Nothing was broken: the supervisor checks every
+  `REMOTE_CONTROL_REFRESH_SEC` (1200s) and one instance self-healed at the
+  next check while we were looking at it. That *is* the problem. The same
+  investigation showed the other half: that instance's log carried three
+  `sending Enter` lines — the unattended nudge had answered confirmation
+  dialogs the operator had opened from claude.ai and not yet answered.
+- **Decision (connection):** the check runs every supervision tick
+  (`REMOTE_CONTROL_CHECK_SEC`, default 5s = `CHECK_INTERVAL_SEC`), and the
+  reconnect is rate-limited on its own timer
+  (`REMOTE_CONTROL_RECONNECT_BACKOFF_SEC`, default 60s).
+  `REMOTE_CONTROL_REFRESH_SEC` is removed, with a startup warning if a
+  config still sets it.
+- **Why:** the 1200s number was inherited from v0.2.0, where it meant "how
+  often to re-send `/remote-control` to keep the connection alive". v0.3.0
+  proved that assumption false and made the check passive, but kept the
+  number — so a value chosen as a keystroke interval silently became "how
+  long an instance may sit unreachable". A file read costs nothing and types
+  nothing; there was never a reason to do it slowly. Separating the two
+  timers is what makes that safe: only the reconnect touches the session, so
+  only the reconnect needs a backoff. The degenerate case (no usable session
+  file at all, so nothing can ever confirm success) keeps a much slower
+  internal 1200s retry, otherwise it would type `/remote-control` into that
+  session forever.
+- **Decision (nudge):** `UNATTENDED_NUDGE_SEC` defaults to `0` — the
+  supervisor does not answer confirmation dialogs unless the operator
+  explicitly turns it on.
+- **Why:** v0.4.0 assumed "no tmux client + parked on a dialog for the full
+  interval" was a good proxy for "abandoned". Production showed it is not:
+  Remote Control is not a tmux client, so an operator reading a dialog on
+  their phone is indistinguishable from an abandoned session, and Enter
+  accepts whatever is highlighted. Rejected alternatives: raising the
+  interval (makes the window smaller, keeps the failure mode, and slows real
+  recovery); treating a *connected* Remote Control as "somebody can answer"
+  and nudging only when disconnected (still guesses — a connected session
+  can be genuinely abandoned, and it would have changed nothing in this
+  incident, since both instances were disconnected); keeping it on and
+  documenting harder (v0.4.0 already documented it, and it still surprised
+  the person who wrote the documentation). The feature stays, with its
+  `waiting`-only guard, for operators who prefer an instance that unsticks
+  itself — it just is not the default.
+- **Consequence:** an abandoned instance parked on a dialog now stays parked
+  until a human answers it. That is the intended tradeoff: the supervisor's
+  job is to keep the session *reachable*, not to make decisions inside it.
+
+---
+
 ## 2026-08-17 — resume the conversation across a reboot instead of starting an empty one
 
 - **Context:** the operator's report, after v0.3.0 had been running a while:
