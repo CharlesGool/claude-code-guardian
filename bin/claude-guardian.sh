@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# claude-guardian — keeps a remotely-attachable Claude Code session alive.
+# claude-guardian — keeps one or more remotely-attachable Claude Code
+# sessions alive, root-managed, on a Debian server.
 # Copyright (C) 2026 CharlesGool
 #
 # This program is free software: you can redistribute it and/or modify
@@ -9,43 +10,73 @@
 # (at your option) any later version. See the LICENSE file, or
 # <https://www.gnu.org/licenses/>, for the full text.
 #
-# Two supervision layers:
-#   1. Inside a detached tmux session: if the `claude` process exits (Ctrl+C,
-#      crash, `exit`), the pane is respawned automatically.
-#   2. A systemd unit (Restart=always) supervises this script itself, so a
-#      reboot or the loop process dying is also recovered from.
+# Each named "instance" gets its own tmux session (all sharing one tmux
+# server/socket) and its own systemd unit instance
+# (claude-guardian@<name>.service, from a template unit). Two supervision
+# layers per instance:
+#   1. Inside its detached tmux session: if `claude` exits (Ctrl+C, crash,
+#      `exit`), the pane is respawned automatically.
+#   2. The systemd instance (Restart=always) supervises the loop script
+#      itself, so a reboot or the loop process dying is also recovered from.
 #
-# This script is self-contained: `install` embeds the systemd unit and the
-# default config as heredocs, so copying this one file is enough to deploy.
+# This script is self-contained: `install` embeds the systemd unit template
+# and the default config as heredocs, so copying this one file is enough to
+# deploy.
 #
-# Usage: claude-guardian <command>
-#   install     preflight checks, then install + enable the systemd service
-#   uninstall   stop/disable the systemd service (session/config untouched)
-#   purge       full teardown: uninstall + kill session + remove config/binary
-#   start       systemctl start claude-guardian
-#   stop        systemctl stop claude-guardian
-#   restart     systemctl restart claude-guardian
-#   status      systemctl status claude-guardian
-#   attach      attach to the live tmux session (remote takeover)
-#   logs        follow the service journal
-#   check       run preflight checks only, report, make no changes
-#   run         (internal) foreground supervision loop; used as ExecStart
+# Usage: claude-guardian <command> [args]
+#   install                     one-time setup: preflight, systemd instance
+#                               template, default config; migrates a
+#                               v0.1.0 single-instance install if found
+#   new <name> [--workdir D] [--args "..."] [--claude-bin PATH]
+#                               create + enable + start a new instance
+#   list                        table of every instance: systemd/tmux state,
+#                               attached?, workdir, remote-control URL
+#   url <name>                  print the stored claude.ai remote-control URL
+#   activate <name>             enable + start an instance (survives reboot)
+#   deactivate <name>           disable + stop supervision only; the live
+#                               tmux session (if any) is left running,
+#                               still attachable
+#   archive <name> [--yes]      deactivate, save scrollback + conversation
+#                               id, then kill the tmux session
+#   archives [prefix]           list archived instances
+#   resume <archive-id> [name]  recreate an instance from an archive and
+#                               continue its conversation (claude --resume)
+#   rm-archive <id> [--yes]     permanently delete one archive
+#   attach [name]               attach to the live tmux session (remote
+#                               takeover); name defaults to 'claude-code'
+#   logs [name]                 follow one instance's service journal
+#   start|stop|restart [name]   systemctl start/stop/restart one instance
+#   status [name]               systemctl status for one instance
+#   uninstall                   stop/disable every instance + remove the
+#                               systemd template (configs/sessions untouched)
+#   purge [--yes]               full teardown: uninstall + kill every live
+#                               session + remove config/state/binary
+#                               (archives are NOT deleted — see rm-archive)
+#   check                       preflight checks only, report, no changes
+#   run <name>                  (internal) foreground supervision loop for
+#                               one instance; used as the unit's ExecStart
+# ---- end of usage --------------------------------------------------------
 
 set -uo pipefail
 
 PROG_NAME="claude-guardian"
 CONFIG_FILE="/etc/claude-guardian/config.env"
-UNIT_PATH="/etc/systemd/system/claude-guardian.service"
+INSTANCES_DIR="/etc/claude-guardian/instances"
+STATE_DIR="/var/lib/claude-guardian/state"
+ARCHIVE_DIR="/var/lib/claude-guardian/archive"
+UNIT_TEMPLATE_PATH="/etc/systemd/system/claude-guardian@.service"
+LEGACY_UNIT_PATH="/etc/systemd/system/claude-guardian.service"
 INSTALL_BIN="/usr/local/bin/claude-guardian"
+DEFAULT_INSTANCE="claude-code"
 
-# ---- defaults (overridden by $CONFIG_FILE if present) ----------------------
-SESSION_NAME="claude-code"
+# ---- defaults (overridden by $CONFIG_FILE, then per-instance by
+#      $INSTANCES_DIR/<name>.env) ------------------------------------------
 TMUX_SOCKET="/run/claude-guardian/tmux.sock"
 WORKDIR="/root"
 CLAUDE_BIN="claude"
 CLAUDE_ARGS="--permission-mode auto --remote-control"
 CHECK_INTERVAL_SEC="5"
-REQUIRED_APT_PKGS="tmux"
+REQUIRED_APT_PKGS="tmux uuid-runtime"
 # When nobody is attached (no tmux client) for this many seconds, send a bare
 # Enter keystroke to clear any confirmation prompt auto mode fell back to
 # after repeated classifier blocks. 0 disables. See DESIGN.md Known limitations.
@@ -54,8 +85,12 @@ UNATTENDED_NUDGE_SEC="300"
 # /remote-control to refresh the connection — Anthropic's docs say a Remote
 # Control session that can't reach the server for ~30 minutes needs a manual
 # /remote-control to reconnect; refreshing well inside that window avoids
-# ever hitting it. 0 disables.
+# ever hitting it. Also re-captures the claude.ai URL into instance state.
+# 0 disables.
 REMOTE_CONTROL_REFRESH_SEC="1200"
+# `new` refuses once this many instances already exist — each concurrent
+# instance is a separate claude process and a separate token cost.
+MAX_SESSIONS="3"
 
 if [ -r "$CONFIG_FILE" ]; then
   # shellcheck disable=SC1090
@@ -73,6 +108,24 @@ die() {
 
 require_root() {
   [ "$(id -u)" -eq 0 ] || die "must be run as root"
+}
+
+validate_name() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]] \
+    || die "instance name must match [A-Za-z0-9_-]+ (tmux/systemd instance names can't contain spaces or slashes): '$1'"
+}
+
+confirm_or_die() {
+  # $1 = prompt text. Requires an interactive tty; callers pass --yes to
+  # skip this entirely (needed for scripted/non-interactive use).
+  [ -t 0 ] || die "refusing to proceed without confirmation in a non-interactive shell — pass --yes"
+  printf '%s' "$1 [y/N] "
+  local reply
+  read -r reply
+  case "$reply" in
+    y|Y|yes|YES) ;;
+    *) die "aborted" ;;
+  esac
 }
 
 # Authoritative login check (not a file-existence guess): `claude auth
@@ -123,7 +176,7 @@ preflight_report() {
     echo "  [ok]      $CLAUDE_BIN auth status reports logged in"
   else
     echo "  [missing] $CLAUDE_BIN auth status reports not logged in"
-    echo "            'install' refuses to proceed until this is fixed: run '$CLAUDE_BIN auth login' first"
+    echo "            'install'/'new' refuse to proceed until this is fixed: run '$CLAUDE_BIN auth login' first"
     ok=1
   fi
 
@@ -131,7 +184,7 @@ preflight_report() {
 }
 
 # Enforcing: auto-installs missing apt packages, hard-fails if claude is
-# missing, only warns on login state. Used by `run` and `install`.
+# missing, only warns on login state. Used by `run`, `install`, and `new`.
 preflight_enforce() {
   require_root
 
@@ -169,19 +222,74 @@ preflight_enforce() {
     fi
   fi
 
-  is_logged_in || log "warning: claude is not logged in ('$CLAUDE_BIN auth status' failed); run '$PROG_NAME attach' to log in interactively (this does not block the running service — only 'install' hard-requires login)"
+  is_logged_in || log "warning: claude is not logged in ('$CLAUDE_BIN auth status' failed); run '$PROG_NAME attach <name>' to log in interactively (this does not block a running instance — only 'install'/'new' hard-require login)"
 }
 
-# Hard requirement for `install` only — deliberately not folded into
+# Hard requirement for `install`/`new` only — deliberately not folded into
 # preflight_enforce, which stays non-blocking on login state so an
-# already-running service that later loses auth keeps retrying instead of
-# refusing to start. Installing a guardian that has never once logged in
-# would just sit respawning a session nobody can use yet, so that specific
-# case is refused outright instead.
+# already-running instance that later loses auth keeps retrying instead of
+# refusing to start. Creating a guardian instance that has never once
+# logged in would just sit respawning a session nobody can use yet, so that
+# specific case is refused outright instead.
 require_login() {
   is_logged_in \
-    || die "claude is not logged in ('$CLAUDE_BIN auth status' failed). Log in first — run '$CLAUDE_BIN auth login', or 'claude' interactively — then retry install."
+    || die "claude is not logged in ('$CLAUDE_BIN auth status' failed). Log in first — run '$CLAUDE_BIN auth login', or 'claude' interactively — then retry."
 }
+
+# ---- instance config / state -------------------------------------------
+
+instance_file() { echo "$INSTANCES_DIR/$1.env"; }
+instance_exists() { [ -e "$(instance_file "$1")" ]; }
+instance_count() {
+  find "$INSTANCES_DIR" -maxdepth 1 -name '*.env' 2>/dev/null | grep -c . || true
+}
+
+# Sources this instance's overrides (WORKDIR/CLAUDE_ARGS/CLAUDE_BIN, and
+# RESUME_SESSION_ID if it was created via `resume`) on top of the global
+# config already sourced at script start.
+load_instance() {
+  local name="$1"
+  if [ -r "$(instance_file "$name")" ]; then
+    # shellcheck disable=SC1090
+    . "$(instance_file "$name")"
+  fi
+}
+
+write_instance_file() {
+  local name="$1" workdir="$2" args="$3" bin="$4" resume_id="${5:-}"
+  install -d -m 0755 "$INSTANCES_DIR"
+  {
+    echo "# claude-guardian instance '$name' — overrides for this instance only."
+    echo "WORKDIR=\"$workdir\""
+    echo "CLAUDE_ARGS=\"$args\""
+    echo "CLAUDE_BIN=\"$bin\""
+    if [ -n "$resume_id" ]; then
+      echo "# set by 'resume' — create_session passes --resume instead of --session-id"
+      echo "RESUME_SESSION_ID=\"$resume_id\""
+    fi
+  } > "$(instance_file "$name")"
+  log "wrote instance config to $(instance_file "$name")"
+}
+
+state_file() { echo "$STATE_DIR/$1.state"; }
+
+state_set() {
+  local name="$1" key="$2" val="$3" f tmp
+  install -d -m 0700 "$STATE_DIR"
+  f=$(state_file "$name")
+  tmp="${f}.tmp.$$"
+  { grep -v "^${key}=" "$f" 2>/dev/null; echo "${key}=${val}"; } > "$tmp"
+  mv "$tmp" "$f"
+}
+
+state_get() {
+  local name="$1" key="$2" f
+  f=$(state_file "$name")
+  [ -r "$f" ] || return 0
+  sed -n "s/^${key}=//p" "$f" | tail -n1
+}
+
+state_rm() { rm -f "$(state_file "$1")"; }
 
 # ---- tmux session management -------------------------------------------
 
@@ -194,20 +302,39 @@ ensure_socket_dir() {
 }
 
 session_exists() {
-  tmux_cmd has-session -t "$SESSION_NAME" 2>/dev/null
+  tmux_cmd has-session -t "$1" 2>/dev/null
 }
 
 pane_is_dead() {
   local dead
-  dead=$(tmux_cmd list-panes -t "$SESSION_NAME" -F '#{pane_dead}' 2>/dev/null | head -n1)
+  dead=$(tmux_cmd list-panes -t "$1" -F '#{pane_dead}' 2>/dev/null | head -n1)
   [ "$dead" = "1" ]
 }
 
+has_attached_client() {
+  [ -n "$(tmux_cmd list-clients -t "$1" 2>/dev/null)" ]
+}
+
 create_session() {
-  log "creating tmux session '$SESSION_NAME' and starting claude"
+  local name="$1" extra_args
+  log "creating tmux session '$name' and starting claude"
+
+  if [ -n "${RESUME_SESSION_ID:-}" ]; then
+    extra_args="--resume $RESUME_SESSION_ID"
+    state_set "$name" claude_session_id "$RESUME_SESSION_ID"
+    log "resuming archived conversation $RESUME_SESSION_ID"
+  else
+    local uuid
+    uuid=$(uuidgen)
+    extra_args="--session-id $uuid"
+    state_set "$name" claude_session_id "$uuid"
+  fi
+  state_set "$name" workdir "$WORKDIR"
+  state_set "$name" created_at "$(date -Iseconds)"
+
   # shellcheck disable=SC2086
-  tmux_cmd new-session -d -s "$SESSION_NAME" -n claude -c "$WORKDIR" -- "$CLAUDE_BIN" $CLAUDE_ARGS
-  tmux_cmd set-option -t "$SESSION_NAME" remain-on-exit on
+  tmux_cmd new-session -d -s "$name" -n claude -c "$WORKDIR" -- "$CLAUDE_BIN" $CLAUDE_ARGS $extra_args
+  tmux_cmd set-option -t "$name" remain-on-exit on
 
   # On a genuinely first-ever run, claude can show an onboarding/trust
   # screen that needs Enter to accept the default before it reaches the
@@ -215,18 +342,24 @@ create_session() {
   # once claude is already at its normal prompt is a harmless no-op, so
   # send two rather than trying to detect exactly which screen is showing.
   sleep 2
-  tmux_cmd send-keys -t "$SESSION_NAME" Enter
+  tmux_cmd send-keys -t "$name" Enter
   sleep 1
-  tmux_cmd send-keys -t "$SESSION_NAME" Enter
+  tmux_cmd send-keys -t "$name" Enter
+
+  # Best-effort: capture the remote-control URL right away so `new` can
+  # print it immediately instead of waiting for the first periodic
+  # refresh (up to REMOTE_CONTROL_REFRESH_SEC later). If claude is still
+  # mid-onboarding beyond the two Enters above, this can type "/remote-
+  # control" into the wrong screen — harmless but may need a manual
+  # '/remote-control' afterwards; see DESIGN.md Known limitations.
+  sleep 1
+  capture_remote_control_url "$name" || true
 }
 
 respawn_pane() {
+  local name="$1"
   log "claude exited (Ctrl+C, crash, or manual exit) — respawning automatically"
-  tmux_cmd respawn-pane -k -t "$SESSION_NAME"
-}
-
-has_attached_client() {
-  [ -n "$(tmux_cmd list-clients -t "$SESSION_NAME" 2>/dev/null)" ]
+  tmux_cmd respawn-pane -k -t "$name"
 }
 
 # auto permission mode falls back to an interactive confirmation after
@@ -237,24 +370,48 @@ has_attached_client() {
 # Enter to actually clear, and an extra Enter once claude is already at its
 # normal prompt is a harmless no-op.
 nudge_enter() {
+  local name="$1"
   log "no attached client for ${UNATTENDED_NUDGE_SEC}s+ — sending Enter (x2) in case a prompt is stuck waiting for confirmation"
-  tmux_cmd send-keys -t "$SESSION_NAME" Enter
+  tmux_cmd send-keys -t "$name" Enter
   sleep 1
-  tmux_cmd send-keys -t "$SESSION_NAME" Enter
+  tmux_cmd send-keys -t "$name" Enter
+}
+
+# Sends /remote-control, waits for the resulting status screen, scrapes the
+# https://claude.ai/code/session_... URL out of the visible pane, stores it
+# in instance state (see `claude-guardian url <name>`), then sends Enter to
+# dismiss the screen (its default-highlighted option is "Continue").
+capture_remote_control_url() {
+  local name="$1" url
+  tmux_cmd send-keys -t "$name" C-u
+  tmux_cmd send-keys -t "$name" "/remote-control" Enter
+  sleep 2
+  url=$(tmux_cmd capture-pane -p -t "$name" 2>/dev/null \
+    | grep -oE 'https://claude\.ai/code/session_[A-Za-z0-9_-]+' | tail -n1)
+  tmux_cmd send-keys -t "$name" Enter
+  if [ -n "$url" ]; then
+    state_set "$name" remote_url "$url"
+    state_set "$name" remote_url_updated_at "$(date -Iseconds)"
+    log "remote control URL for '$name': $url"
+  else
+    log "warning: could not capture a remote-control URL for '$name' — check manually with '$PROG_NAME attach $name'"
+  fi
 }
 
 # Remote Control sessions that can't reach the server for ~30 minutes need a
 # manual /remote-control to reconnect (Anthropic docs). Refresh proactively,
-# comfortably inside that window, so it's never actually hit.
+# comfortably inside that window, so it's never actually hit — and re-store
+# the (possibly changed) URL while we're there.
 refresh_remote_control() {
+  local name="$1"
   log "no attached client for ${REMOTE_CONTROL_REFRESH_SEC}s+ — refreshing remote control connection"
-  tmux_cmd send-keys -t "$SESSION_NAME" C-u
-  tmux_cmd send-keys -t "$SESSION_NAME" "/remote-control" Enter
+  capture_remote_control_url "$name"
 }
 
 supervise_loop() {
+  local name="$1"
   ensure_socket_dir
-  log "supervision loop started: session=$SESSION_NAME socket=$TMUX_SOCKET interval=${CHECK_INTERVAL_SEC}s"
+  log "supervision loop started: instance=$name socket=$TMUX_SOCKET interval=${CHECK_INTERVAL_SEC}s"
 
   local stop=0
   trap 'stop=1' TERM INT
@@ -268,13 +425,13 @@ supervise_loop() {
   last_refresh=$(date +%s)
 
   while [ "$stop" -eq 0 ]; do
-    if ! session_exists; then
-      create_session
+    if ! session_exists "$name"; then
+      create_session "$name"
       last_nudge=$(date +%s)
       last_refresh=$(date +%s)
-    elif pane_is_dead; then
-      respawn_pane
-    elif has_attached_client; then
+    elif pane_is_dead "$name"; then
+      respawn_pane "$name"
+    elif has_attached_client "$name"; then
       # someone is live in the session — never nudge/refresh while attended,
       # and reset the timers so a nudge doesn't fire right after they leave
       last_nudge=$(date +%s)
@@ -283,11 +440,11 @@ supervise_loop() {
       local now
       now=$(date +%s)
       if [ "$UNATTENDED_NUDGE_SEC" -gt 0 ] && [ $(( now - last_nudge )) -ge "$UNATTENDED_NUDGE_SEC" ]; then
-        nudge_enter
+        nudge_enter "$name"
         last_nudge=$now
       fi
       if [ "$REMOTE_CONTROL_REFRESH_SEC" -gt 0 ] && [ $(( now - last_refresh )) -ge "$REMOTE_CONTROL_REFRESH_SEC" ]; then
-        refresh_remote_control
+        refresh_remote_control "$name"
         last_refresh=$now
       fi
     fi
@@ -307,23 +464,26 @@ write_default_config() {
   fi
   install -d -m 0755 "$(dirname "$CONFIG_FILE")"
   cat > "$CONFIG_FILE" <<'EOF'
-# claude-guardian runtime configuration.
-# Edit values here, then: systemctl restart claude-guardian
+# claude-guardian runtime configuration — shared defaults for every
+# instance. Per-instance overrides (WORKDIR, CLAUDE_ARGS, CLAUDE_BIN) live
+# in /etc/claude-guardian/instances/<name>.env instead — see `new --help`
+# in README.md. Edit values here, then restart the affected instance(s),
+# e.g.: systemctl restart 'claude-guardian@*'
 
-# tmux session name that hosts the claude process
-SESSION_NAME="claude-code"
-
-# tmux server socket path (kept off the default /tmp socket on purpose)
+# tmux server socket path (kept off the default /tmp socket on purpose).
+# Shared by every instance: one tmux server, many sessions.
 TMUX_SOCKET="/run/claude-guardian/tmux.sock"
 
-# working directory claude starts in
+# working directory claude starts in, for any instance that doesn't
+# override it with `new --workdir`
 WORKDIR="/root"
 
 # claude executable; override with an absolute path if it is not on
 # systemd's PATH (check with `command -v claude` as root)
 CLAUDE_BIN="claude"
 
-# extra arguments passed to claude on every (re)start.
+# extra arguments passed to claude on every (re)start, for any instance
+# that doesn't override it with `new --args`.
 # --permission-mode auto: use the auto-mode classifier instead of manual
 #   per-action approval (still safer than --dangerously-skip-permissions).
 # --remote-control: prints a claude.ai/code/... URL you can control the
@@ -334,7 +494,7 @@ CLAUDE_ARGS="--permission-mode auto --remote-control"
 CHECK_INTERVAL_SEC="5"
 
 # space-separated apt package names auto-installed if missing
-REQUIRED_APT_PKGS="tmux"
+REQUIRED_APT_PKGS="tmux uuid-runtime"
 
 # when nobody is attached (no tmux client) this many seconds, send a bare
 # Enter to clear a confirmation prompt auto mode may have fallen back to.
@@ -343,9 +503,14 @@ UNATTENDED_NUDGE_SEC="300"
 
 # when nobody is attached this many seconds, proactively re-run
 # /remote-control to refresh the connection before Anthropic's ~30-minute
-# "could not reach the Remote Control server" threshold is ever hit.
+# "could not reach the Remote Control server" threshold is ever hit, and
+# re-capture the claude.ai URL (see `claude-guardian url <name>`).
 # 0 disables.
 REMOTE_CONTROL_REFRESH_SEC="1200"
+
+# `new` refuses once this many instances already exist — each concurrent
+# instance is a separate claude process and a separate token cost.
+MAX_SESSIONS="3"
 EOF
 
   # Resolve claude to an absolute path using *this installer's* environment
@@ -365,10 +530,10 @@ EOF
   log "wrote default config to $CONFIG_FILE"
 }
 
-write_unit_file() {
-  cat > "$UNIT_PATH" <<EOF
+write_unit_template() {
+  cat > "$UNIT_TEMPLATE_PATH" <<EOF
 [Unit]
-Description=Claude Code guardian (keeps a remotely-attachable claude session alive)
+Description=Claude Code guardian instance '%i' (remotely-attachable claude session)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=60
@@ -376,7 +541,7 @@ StartLimitBurst=10
 
 [Service]
 Type=simple
-ExecStart=$INSTALL_BIN run
+ExecStart=$INSTALL_BIN run %i
 Restart=always
 RestartSec=5
 User=root
@@ -389,7 +554,22 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-  log "wrote systemd unit to $UNIT_PATH"
+  log "wrote systemd instance template to $UNIT_TEMPLATE_PATH"
+}
+
+# v0.1.0 shipped a single non-templated unit (claude-guardian.service,
+# implicitly the 'claude-code' instance). Disable/remove it so the v0.2.0
+# template (claude-guardian@claude-code.service) can take over the SAME
+# tmux session without recreating it. Safe to run even against a live
+# session: KillMode=process (both old and new unit) means this only stops
+# the supervision loop, never the tmux server or the claude process inside
+# it — verified in DESIGN.md "systemd layer" / "KillMode=process".
+migrate_legacy_unit() {
+  [ -e "$LEGACY_UNIT_PATH" ] || return 0
+  log "found a v0.1.0 single-instance unit at $LEGACY_UNIT_PATH — migrating to instance '$DEFAULT_INSTANCE' (the live tmux session, if any, is not touched)"
+  systemctl disable --now claude-guardian.service 2>/dev/null || true
+  rm -f "$LEGACY_UNIT_PATH"
+  systemctl daemon-reload
 }
 
 # ---- commands -----------------------------------------------------------
@@ -403,8 +583,10 @@ cmd_check() {
 }
 
 cmd_run() {
+  local name="${1:-$DEFAULT_INSTANCE}"
+  load_instance "$name"
   preflight_enforce
-  supervise_loop
+  supervise_loop "$name"
 }
 
 cmd_install() {
@@ -420,86 +602,380 @@ cmd_install() {
     log "installed script to $INSTALL_BIN"
   fi
 
-  write_unit_file
+  migrate_legacy_unit
+
+  write_unit_template
   systemctl daemon-reload
-  systemctl enable claude-guardian.service
-  log "install complete. Start it with: $PROG_NAME start"
+
+  if ! instance_exists "$DEFAULT_INSTANCE"; then
+    write_instance_file "$DEFAULT_INSTANCE" "$WORKDIR" "$CLAUDE_ARGS" "$CLAUDE_BIN"
+  fi
+  systemctl enable "claude-guardian@${DEFAULT_INSTANCE}.service"
+
+  log "install complete. Start the default instance with: $PROG_NAME start"
+  log "create additional concurrent instances with: $PROG_NAME new <name>"
+}
+
+cmd_new() {
+  require_root
+  local name="${1:-}"
+  shift || true
+  [ -n "$name" ] || die "usage: $PROG_NAME new <name> [--workdir DIR] [--args \"...\"] [--claude-bin PATH]"
+  validate_name "$name"
+  [ "$name" != "run" ] || die "'run' is a reserved command name, pick another instance name"
+  instance_exists "$name" \
+    && die "instance '$name' already exists (config: $(instance_file "$name")). Use '$PROG_NAME activate $name' to (re)start it, or pick a different name."
+
+  local count
+  count=$(instance_count)
+  if [ "$count" -ge "$MAX_SESSIONS" ]; then
+    die "already at MAX_SESSIONS=$MAX_SESSIONS (see $CONFIG_FILE). Each concurrent instance is a separate claude process/token cost — raise MAX_SESSIONS if you really want more, or archive/rm-archive an existing instance first ('$PROG_NAME list')."
+  fi
+
+  local new_workdir="$WORKDIR" new_args="$CLAUDE_ARGS" new_bin="$CLAUDE_BIN"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --workdir)    new_workdir="$2"; shift 2 ;;
+      --args)       new_args="$2"; shift 2 ;;
+      --claude-bin) new_bin="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [ -d "$new_workdir" ] || die "--workdir '$new_workdir' does not exist"
+
+  CLAUDE_BIN="$new_bin"
+  preflight_enforce
+  require_login
+
+  write_instance_file "$name" "$new_workdir" "$new_args" "$CLAUDE_BIN"
+  systemctl daemon-reload
+  systemctl enable --now "claude-guardian@${name}.service"
+  log "instance '$name' enabled and starting — this can take a few seconds"
+
+  sleep 5
+  local url
+  url=$(state_get "$name" remote_url)
+  if [ -n "$url" ]; then
+    log "remote control URL: $url"
+  else
+    log "URL not captured yet — check shortly with '$PROG_NAME url $name'"
+  fi
+}
+
+cmd_list() {
+  local files
+  files=$(find "$INSTANCES_DIR" -maxdepth 1 -name '*.env' 2>/dev/null | sort)
+  if [ -z "$files" ]; then
+    echo "no instances. Create one with: $PROG_NAME new <name>"
+    return
+  fi
+
+  printf '%-16s %-10s %-6s %-10s %-22s %s\n' NAME SYSTEMD TMUX ATTACHED WORKDIR URL
+  local f name active tmux_state attached workdir url
+  while IFS= read -r f; do
+    name=$(basename "$f" .env)
+    active=$(systemctl is-active "claude-guardian@${name}.service" 2>/dev/null || echo inactive)
+    if session_exists "$name"; then
+      tmux_state="up"
+      attached=$(has_attached_client "$name" && echo yes || echo no)
+    else
+      tmux_state="down"
+      attached="-"
+    fi
+    workdir=$(state_get "$name" workdir)
+    [ -n "$workdir" ] || workdir="-"
+    url=$(state_get "$name" remote_url)
+    [ -n "$url" ] || url="(not captured yet — try '$PROG_NAME url $name')"
+    printf '%-16s %-10s %-6s %-10s %-22s %s\n' "$name" "$active" "$tmux_state" "$attached" "$workdir" "$url"
+  done <<< "$files"
+}
+
+cmd_url() {
+  local name="${1:-$DEFAULT_INSTANCE}"
+  instance_exists "$name" || die "no such instance '$name' ($PROG_NAME list)"
+  local url
+  url=$(state_get "$name" remote_url)
+  if [ -n "$url" ]; then
+    echo "$url"
+    local ts
+    ts=$(state_get "$name" remote_url_updated_at)
+    [ -n "$ts" ] && log "captured at $ts"
+  else
+    die "no URL captured yet for '$name'. It's captured automatically on creation and every REMOTE_CONTROL_REFRESH_SEC while unattended; check '$PROG_NAME logs $name', or attach and run /remote-control yourself."
+  fi
+}
+
+cmd_activate() {
+  require_root
+  local name="${1:-$DEFAULT_INSTANCE}"
+  instance_exists "$name" \
+    || die "no such instance '$name' ($PROG_NAME list; or '$PROG_NAME resume <archive-id>' if it was archived)"
+  systemctl enable --now "claude-guardian@${name}.service"
+  log "instance '$name' activated (enabled at boot, started now)"
+}
+
+cmd_deactivate() {
+  require_root
+  local name="${1:-$DEFAULT_INSTANCE}"
+  systemctl disable --now "claude-guardian@${name}.service" 2>/dev/null \
+    || log "warning: 'systemctl disable --now' reported an issue for '$name' (it may already be inactive)"
+  log "instance '$name' deactivated — supervision stopped and won't restart at boot; its live tmux session (if any) was left running, still attachable with '$PROG_NAME attach $name'. Run '$PROG_NAME activate $name' to resume supervision."
+}
+
+cmd_archive() {
+  require_root
+  local name="" yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: $PROG_NAME archive <name> [--yes]"
+  instance_exists "$name" || die "no such instance '$name' ($PROG_NAME list)"
+
+  if [ "$yes" -ne 1 ]; then
+    confirm_or_die "This stops instance '$name', saves its scrollback + conversation id, then KILLS the live tmux session. Continue?"
+  fi
+
+  systemctl disable --now "claude-guardian@${name}.service" 2>/dev/null || true
+
+  local ts archive_dir
+  ts=$(date +%Y%m%dT%H%M%S)
+  archive_dir="$ARCHIVE_DIR/${name}-${ts}"
+  install -d -m 0700 "$archive_dir"
+
+  if session_exists "$name"; then
+    tmux_cmd capture-pane -pS - -t "$name" > "$archive_dir/scrollback.txt" 2>/dev/null || true
+    tmux_cmd kill-session -t "$name" 2>/dev/null || true
+    log "captured scrollback and killed tmux session '$name'"
+  else
+    log "no live tmux session for '$name' — archiving config/state only"
+  fi
+
+  {
+    echo "name=$name"
+    echo "archived_at=$(date -Iseconds)"
+    echo "claude_session_id=$(state_get "$name" claude_session_id)"
+    echo "workdir=$(state_get "$name" workdir)"
+    echo "remote_url=$(state_get "$name" remote_url)"
+    echo "created_at=$(state_get "$name" created_at)"
+  } > "$archive_dir/meta.env"
+
+  [ -e "$(instance_file "$name")" ] && cp "$(instance_file "$name")" "$archive_dir/instance.env"
+
+  rm -f "$(instance_file "$name")"
+  state_rm "$name"
+
+  log "archived to $archive_dir"
+  log "resume the conversation later with: $PROG_NAME resume $(basename "$archive_dir")"
+}
+
+cmd_archives() {
+  local filter="${1:-}"
+  local dirs
+  dirs=$(find "$ARCHIVE_DIR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+  if [ -z "$dirs" ]; then
+    echo "no archives."
+    return
+  fi
+
+  printf '%-30s %-14s %-22s %s\n' ARCHIVE-ID NAME ARCHIVED-AT WORKDIR
+  local d id name archived_at workdir
+  while IFS= read -r d; do
+    id=$(basename "$d")
+    if [ -n "$filter" ]; then
+      case "$id" in "$filter"*) ;; *) continue ;; esac
+    fi
+    name=$(sed -n 's/^name=//p' "$d/meta.env" 2>/dev/null)
+    archived_at=$(sed -n 's/^archived_at=//p' "$d/meta.env" 2>/dev/null)
+    workdir=$(sed -n 's/^workdir=//p' "$d/meta.env" 2>/dev/null)
+    printf '%-30s %-14s %-22s %s\n' "$id" "$name" "$archived_at" "$workdir"
+  done <<< "$dirs"
+}
+
+cmd_resume() {
+  require_root
+  local archive_id="${1:-}" new_name="${2:-}"
+  [ -n "$archive_id" ] || die "usage: $PROG_NAME resume <archive-id> [new-name]"
+
+  local archive_dir="$ARCHIVE_DIR/$archive_id"
+  if [ ! -d "$archive_dir" ]; then
+    # convenience: allow the original instance name if exactly one archive
+    # was made from it (archive dirs are named <name>-<timestamp>)
+    local matches n
+    matches=$(find "$ARCHIVE_DIR" -maxdepth 1 -mindepth 1 -type d -name "${archive_id}-*" 2>/dev/null | sort)
+    n=$(printf '%s\n' "$matches" | grep -c . || true)
+    if [ "$n" -eq 1 ]; then
+      archive_dir="$matches"
+      archive_id=$(basename "$archive_dir")
+    elif [ "$n" -gt 1 ]; then
+      local ids=""
+      while IFS= read -r d; do ids="$ids $(basename "$d")"; done <<< "$matches"
+      die "multiple archives match '$archive_id' — use the exact archive id:$ids"
+    else
+      die "no archive '$archive_id' found ($PROG_NAME archives)"
+    fi
+  fi
+
+  local orig_name resume_id workdir
+  orig_name=$(sed -n 's/^name=//p' "$archive_dir/meta.env")
+  resume_id=$(sed -n 's/^claude_session_id=//p' "$archive_dir/meta.env")
+  workdir=$(sed -n 's/^workdir=//p' "$archive_dir/meta.env")
+  [ -n "$resume_id" ] \
+    || die "archive '$archive_id' has no recorded claude session id — cannot resume; the scrollback in $archive_dir/scrollback.txt can still be read manually"
+
+  local name="${new_name:-$orig_name}"
+  validate_name "$name"
+  instance_exists "$name" \
+    && die "instance '$name' already exists — pick a different name: $PROG_NAME resume $archive_id <new-name>"
+
+  local count
+  count=$(instance_count)
+  [ "$count" -ge "$MAX_SESSIONS" ] \
+    && die "already at MAX_SESSIONS=$MAX_SESSIONS ($CONFIG_FILE)"
+
+  local args="" bin=""
+  if [ -r "$archive_dir/instance.env" ]; then
+    args=$(sed -n 's/^CLAUDE_ARGS="\(.*\)"$/\1/p' "$archive_dir/instance.env")
+    bin=$(sed -n 's/^CLAUDE_BIN="\(.*\)"$/\1/p' "$archive_dir/instance.env")
+  fi
+  [ -n "$args" ] || args="$CLAUDE_ARGS"
+  [ -n "$bin" ] || bin="$CLAUDE_BIN"
+  [ -n "$workdir" ] || workdir="$WORKDIR"
+
+  write_instance_file "$name" "$workdir" "$args" "$bin" "$resume_id"
+  systemctl daemon-reload
+  systemctl enable --now "claude-guardian@${name}.service"
+  log "resuming archived conversation from '$archive_id' as instance '$name' (claude session $resume_id)"
+  log "note: the archive at $archive_dir is left in place — remove it explicitly with '$PROG_NAME rm-archive $archive_id' once you no longer need it"
+}
+
+cmd_rm_archive() {
+  require_root
+  local id="" yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      *) id="$1"; shift ;;
+    esac
+  done
+  [ -n "$id" ] || die "usage: $PROG_NAME rm-archive <archive-id> [--yes]"
+  local d="$ARCHIVE_DIR/$id"
+  [ -d "$d" ] || die "no archive '$id' ($PROG_NAME archives)"
+  if [ "$yes" -ne 1 ]; then
+    confirm_or_die "Permanently delete archive '$id' (scrollback + conversation id record)? This cannot be undone."
+  fi
+  rm -rf "$d"
+  log "removed archive $id"
 }
 
 cmd_uninstall() {
   require_root
-  systemctl disable --now claude-guardian.service 2>/dev/null || true
-  rm -f "$UNIT_PATH"
+  local f name
+  while IFS= read -r f; do
+    name=$(basename "$f" .env)
+    systemctl disable --now "claude-guardian@${name}.service" 2>/dev/null || true
+  done < <(find "$INSTANCES_DIR" -maxdepth 1 -name '*.env' 2>/dev/null)
+  rm -f "$UNIT_TEMPLATE_PATH"
   systemctl daemon-reload
-  log "systemd service removed. Config ($CONFIG_FILE) and any running tmux session were left untouched."
-  log "to also remove the config: rm -rf $(dirname "$CONFIG_FILE")"
-  log "to also kill the live session: tmux -S $TMUX_SOCKET kill-session -t $SESSION_NAME"
+  log "systemd instance template removed; every instance disabled. Configs ($INSTANCES_DIR) and any running tmux sessions were left untouched."
+  log "to also remove configs: rm -rf $(dirname "$CONFIG_FILE")"
+  log "to also kill all live sessions: tmux -S $TMUX_SOCKET kill-server"
   log "or run '$PROG_NAME purge' to do all of the above (and remove the installed binary) in one step"
 }
 
-# Full teardown: everything `uninstall` deliberately leaves behind, plus the
-# live tmux session/socket and the installed binary. Unlike `uninstall`,
-# this kills any in-progress claude session — it's the explicit "remove
-# everything" command, not the routine-maintenance one.
+# Full teardown: everything `uninstall` deliberately leaves behind, plus
+# every live tmux session/socket and the installed binary. Unlike
+# `uninstall`, this kills every in-progress claude instance — it's the
+# explicit "remove everything" command, not the routine-maintenance one.
+# Archives are deliberately NOT touched — see 'rm-archive' to remove those.
 cmd_purge() {
   require_root
+  local yes=0
+  [ "${1:-}" = "--yes" ] && yes=1
 
-  systemctl disable --now claude-guardian.service 2>/dev/null || true
-  rm -f "$UNIT_PATH"
+  local count
+  count=$(instance_count)
+  if [ "$yes" -ne 1 ]; then
+    confirm_or_die "This stops and KILLS all $count live instance(s), removes all config/state, and removes the installed binary (archives are kept). Continue?"
+  fi
+
+  local f name
+  while IFS= read -r f; do
+    name=$(basename "$f" .env)
+    systemctl disable --now "claude-guardian@${name}.service" 2>/dev/null || true
+  done < <(find "$INSTANCES_DIR" -maxdepth 1 -name '*.env' 2>/dev/null)
+  rm -f "$UNIT_TEMPLATE_PATH" "$LEGACY_UNIT_PATH"
   systemctl daemon-reload
-  systemctl reset-failed claude-guardian 2>/dev/null || true
-  log "systemd service stopped, disabled, and unit file removed"
+  systemctl reset-failed 'claude-guardian@*' claude-guardian 2>/dev/null || true
+  log "every instance stopped and disabled; unit template removed"
 
   if command -v tmux >/dev/null 2>&1 && [ -S "$TMUX_SOCKET" ]; then
     tmux_cmd kill-server 2>/dev/null || true
-    log "killed tmux server on $TMUX_SOCKET (session '$SESSION_NAME' and claude with it)"
+    log "killed the tmux server on $TMUX_SOCKET (every session and claude process with it)"
   fi
   rm -rf "$(dirname "$TMUX_SOCKET")"
 
   rm -rf "$(dirname "$CONFIG_FILE")"
   log "removed config directory $(dirname "$CONFIG_FILE")"
 
+  rm -rf "$STATE_DIR"
   rm -f "$INSTALL_BIN"
   log "removed installed binary $INSTALL_BIN"
 
-  log "purge complete. Not touched: the claude CLI itself, its login credentials, and any git clone of this repo."
+  log "purge complete. Not touched: the claude CLI itself, its login credentials, any git clone of this repo, and $ARCHIVE_DIR (remove archives explicitly with rm-archive if you want them gone too)."
 }
 
 cmd_attach() {
+  local name="${1:-$DEFAULT_INSTANCE}"
   command -v tmux >/dev/null 2>&1 || die "tmux not installed"
-  session_exists || die "no live session '$SESSION_NAME' on socket $TMUX_SOCKET (is the service running?)"
-  log "attaching — detach with the tmux prefix + d (NOT Ctrl+C, which restarts claude instead)"
-  exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION_NAME"
+  session_exists "$name" \
+    || die "no live tmux session '$name' on socket $TMUX_SOCKET (is 'claude-guardian@${name}' running? check '$PROG_NAME list')"
+  log "attaching to '$name' — detach with the tmux prefix + d (NOT Ctrl+C, which restarts claude instead)"
+  exec tmux_cmd attach -t "$name"
 }
 
 cmd_logs() {
-  exec journalctl -u claude-guardian -f "$@"
+  local name="${1:-$DEFAULT_INSTANCE}"
+  shift || true
+  exec journalctl -u "claude-guardian@${name}.service" -f "$@"
 }
 
 usage() {
   # Pattern range instead of fixed line numbers — a fixed range silently
   # went stale (and printed the wrong text) the moment the header comment
   # above it grew, e.g. when the GPL notice was added. Matching on the
-  # "Usage:" line itself instead can't drift out of sync with edits above it.
-  sed -n '/^# Usage:/,/^#   run /p' "$0" | sed 's/^# \{0,1\}//'
+  # "Usage:" line and a dedicated end-of-usage sentinel instead can't drift
+  # out of sync with edits above or within it.
+  sed -n '/^# Usage:/,/^# ---- end of usage/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
 }
 
 main() {
   local cmd="${1:-}"
   shift || true
   case "$cmd" in
-    install)   cmd_install "$@" ;;
-    uninstall) cmd_uninstall "$@" ;;
-    purge)     cmd_purge "$@" ;;
-    start)     require_root; systemctl start claude-guardian ;;
-    stop)      require_root; systemctl stop claude-guardian ;;
-    restart)   require_root; systemctl restart claude-guardian ;;
-    status)    systemctl status claude-guardian "$@" ;;
-    attach)    cmd_attach ;;
-    logs)      cmd_logs "$@" ;;
-    check)     cmd_check ;;
-    run)       cmd_run ;;
-    *)         usage; exit 1 ;;
+    install)    cmd_install ;;
+    new)        cmd_new "$@" ;;
+    list)       cmd_list ;;
+    url)        cmd_url "${1:-}" ;;
+    activate)   cmd_activate "${1:-}" ;;
+    deactivate) cmd_deactivate "${1:-}" ;;
+    archive)    cmd_archive "$@" ;;
+    archives)   cmd_archives "${1:-}" ;;
+    resume)     cmd_resume "$@" ;;
+    rm-archive) cmd_rm_archive "$@" ;;
+    attach)     cmd_attach "${1:-}" ;;
+    logs)       cmd_logs "$@" ;;
+    start)      require_root; systemctl start "claude-guardian@${1:-$DEFAULT_INSTANCE}.service" ;;
+    stop)       require_root; systemctl stop "claude-guardian@${1:-$DEFAULT_INSTANCE}.service" ;;
+    restart)    require_root; systemctl restart "claude-guardian@${1:-$DEFAULT_INSTANCE}.service" ;;
+    status)     systemctl status "claude-guardian@${1:-$DEFAULT_INSTANCE}.service" ;;
+    uninstall)  cmd_uninstall ;;
+    purge)      cmd_purge "$@" ;;
+    check)      cmd_check ;;
+    run)        cmd_run "$@" ;;
+    *)          usage; exit 1 ;;
   esac
 }
 
