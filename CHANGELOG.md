@@ -4,7 +4,7 @@ Newest version first. Only changes a user can perceive — internal refactors do
 not need an entry. Draft from `git log <previous-tag>..HEAD --oneline`, then
 rewrite in user-facing terms.
 
-## v0.2.0 — unreleased
+## v0.2.0 — 2026-08-17
 
 `claude-guardian` now supervises multiple named, concurrent Claude Code
 instances instead of exactly one. See DECISIONS.md, 2026-08-17, for why.
