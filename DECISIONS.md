@@ -8,6 +8,99 @@ already-rejected option gets recommended again two weeks later.
 
 ---
 
+## 2026-08-17 — reverses "single default session" (2026-08-16): add named, concurrent multi-instance support
+
+- **Context:** the operator's real workflow evolved into wanting several
+  independent, concurrently-supervised `claude` conversations available at
+  once (e.g. one per project), each separately remotely-controllable, with
+  the ability to pause ("deactivate") or permanently archive one without
+  affecting the others — none of which the single-instance design could
+  do. Before building anything, it was verified live that a single
+  claude.ai account *can* host more than one concurrent
+  `--remote-control` session (the operator was already doing this
+  manually) — this was the one open technical unknown from the 2026-08-16
+  decision below ("Revisit if the operator later needs to run more than
+  one Claude instance concurrently").
+- **Decision:** turn the systemd unit into a template
+  (`claude-guardian@<name>.service`), exactly as sketched in DESIGN.md's
+  "How to extend" section at the time. One tmux server (one
+  `TMUX_SOCKET`), many named sessions — tmux already supports this
+  natively, so no per-instance socket was needed. Per-instance config
+  lives at `/etc/claude-guardian/instances/<name>.env` (overrides
+  `WORKDIR`/`CLAUDE_ARGS`/`CLAUDE_BIN` only); `TMUX_SOCKET`,
+  `CHECK_INTERVAL_SEC`, `REQUIRED_APT_PKGS`, `UNATTENDED_NUDGE_SEC`,
+  `REMOTE_CONTROL_REFRESH_SEC`, and the new `MAX_SESSIONS` stay global,
+  shared machine-wide knobs — instance-specific overrides for those were
+  not a real requirement, and adding them would have doubled the config
+  surface for no asked-for benefit.
+- **New capabilities added as part of this reversal:**
+  - `new` / `activate` / `deactivate`: create, resume-supervision, and
+    pause-supervision-without-killing-the-session, respectively.
+    `deactivate` was deliberately kept distinct from `archive` — the
+    operator asked for both "取消激活" (pause) and "归档" (archive) as
+    separate, non-destructive-vs-destructive operations.
+  - `archive` / `resume` / `archives` / `rm-archive`: the operator
+    confirmed archiving should **kill** the live claude process after
+    saving state (not just deactivate-and-leave-running) — see the
+    "archive kills the process" sub-decision below.
+  - Each instance now gets a `claude --session-id <uuid>` at creation
+    (generated via `uuidgen`, hence `uuid-runtime` added to
+    `REQUIRED_APT_PKGS`) instead of leaving it implicit, specifically so
+    `archive` can record which on-disk conversation
+    (`~/.claude/projects/<escaped-cwd>/<uuid>.jsonl`) belongs to which
+    instance, and `resume` can hand that same id back to
+    `claude --resume <uuid>`. Verified directly: `claude --help` exposes
+    `--session-id`, `--resume`, and `--fork-session`; conversation
+    transcripts do live at that path (confirmed against this host's own
+    `~/.claude/projects/-root/*.jsonl`).
+  - The claude.ai remote-control URL (`https://claude.ai/code/session_...`)
+    is now scraped from the tmux pane right after each instance starts
+    (and re-scraped on every unattended `/remote-control` refresh) and
+    stored in per-instance state, so `claude-guardian url <name>` /
+    `list` can print it without a human ever needing to attach — this was
+    the operator's explicit goal ("以后都不需要终端"). Verified live: the
+    text `https://claude.ai/code/session_...` is present in
+    `tmux capture-pane -p`'s output right after `/remote-control` runs.
+- **Sub-decision — archive kills the process, not just deactivates:**
+  confirmed explicitly with the operator (asked directly: deactivate-only
+  vs. capture-then-kill). Rationale: an "archived" instance should free
+  its tmux pane and process resources, not sit paused forever counting
+  against `MAX_SESSIONS`-adjacent resource limits; the scrollback and
+  `claude_session_id` are saved to `/var/lib/claude-guardian/archive/`
+  before the kill specifically so nothing about the conversation is lost.
+- **Rejected:**
+  - **Keep single-instance, let the operator run a second unrelated copy
+    of the tool by hand** — defeats the point of a guardian: the second
+    copy would have no supervision, no auto-respawn, no unattended
+    keepalive, and no unified `list`/`archive` story.
+  - **Per-instance `TMUX_SOCKET`** (one tmux server per instance) — tmux
+    already multiplexes sessions on one server; a second server per
+    instance would only add operational overhead (N sockets to track, N
+    servers to keep alive) with no capability gained.
+  - **A REST/HTTP control API for lifecycle management** — the operator's
+    ask was CLI/remote-control based ("不需要终端" refers to not needing
+    to SSH in, not to replacing the CLI itself, which is still driven
+    from a remote `claude` session via the tool's own commands); adding a
+    network-facing control plane would be a large, unrequested increase
+    in attack surface for a single-operator, single-host tool.
+- **Consequences:** every documented command that used to take no instance
+  argument (`attach`, `logs`, `start`, `stop`, `restart`, `status`)
+  still works with none, defaulting to the `claude-code` instance, so an
+  existing v0.1.0 deployment's muscle-memory commands keep working
+  post-upgrade. `install` on an existing v0.1.0 host disables/removes the
+  old non-templated unit and re-enables the same tmux session under the
+  new template (`claude-guardian@claude-code.service`) — `KillMode=process`
+  in both the old and new unit means this only ever stops the supervision
+  *loop*, never the tmux server or the `claude` process inside it, so an
+  in-progress conversation survives the upgrade. `purge`'s blast radius
+  grew from "one session" to "every live instance" — it now prints the
+  live instance count and requires interactive confirmation (or `--yes`)
+  before proceeding, and deliberately leaves `/var/lib/claude-guardian/archive/`
+  untouched (archives must be removed explicitly via `rm-archive`) so a
+  full teardown can never silently destroy an archived conversation.
+
+---
+
 ## 2026-08-16 — `install` hard-refuses if claude isn't logged in; login check switched to `claude auth status`
 
 - **Context:** user asked for a login check that actually blocks

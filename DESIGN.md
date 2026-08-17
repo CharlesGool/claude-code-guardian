@@ -8,12 +8,25 @@
 ## Goals & non-goals
 
 **Goals**
-- On a Debian-family server, keep exactly one `claude` (Claude Code CLI)
-  process alive at all times, inside a detachable terminal multiplexer
-  session, so an operator can take over it remotely at any time — either
-  via Claude Code's own Remote Control (a `claude.ai/code/...` URL,
-  controllable from the web or a phone) or by SSH + `tmux attach`.
-- Survive a reboot (service starts at boot).
+- On a Debian-family server, keep one or more named `claude` (Claude Code
+  CLI) instances alive concurrently, each inside its own detachable
+  terminal multiplexer session, so an operator can take any of them over
+  remotely at any time — either via Claude Code's own Remote Control (a
+  `claude.ai/code/...` URL, controllable from the web or a phone) or by
+  SSH + `tmux attach`. See `DECISIONS.md`, 2026-08-17, for why this
+  replaced the original single-session design.
+- Make every instance's remote-control URL retrievable without attaching
+  to it — captured automatically at creation and on every unattended
+  refresh, stored per instance, printed by `list`/`url`. The point is that
+  an operator can create, discover, and reach a session entirely from
+  another Claude Code session driving this tool's CLI, without ever
+  needing a terminal of their own.
+- Let an instance be **paused** (`deactivate`/`activate`: stop/resume
+  supervision, tmux session left running) independently of being
+  **archived** (`archive`/`resume`: save scrollback + conversation id,
+  then kill the process; recreate later via `claude --resume`) — these are
+  deliberately two different operations with two different blast radii.
+- Survive a reboot (each enabled instance's service starts at boot).
 - Survive the `claude` process itself being killed — Ctrl+C, crash, `exit`,
   OOM kill — by automatically restarting it within seconds, without losing
   the surrounding session.
@@ -25,90 +38,142 @@
 - Run preflight checks: required `apt` packages present (auto-install if
   missing), `claude` binary present (hard requirement, never
   auto-installed). Login state is checked via `claude auth status`
-  (authoritative, not a file-existence guess) — `install` refuses to
-  proceed if not logged in (an installed-but-never-logged-in guardian
-  would just sit respawning a session nobody can use), while `run` only
-  warns, so a service that later loses auth keeps retrying instead of
-  refusing to start.
-- Be operable with a small, memorable CLI (`claude-guardian <verb>`).
+  (authoritative, not a file-existence guess) — `install`/`new` refuse to
+  proceed if not logged in (an instance that has never logged in would
+  just sit respawning a session nobody can use), while `run` only warns,
+  so an instance that later loses auth keeps retrying instead of refusing
+  to start.
+- Bound resource/cost growth: `new` refuses once `MAX_SESSIONS` concurrent
+  instances already exist (default 3) — each instance is a separate
+  `claude` process and a separate token cost.
+- Be operable with a small, memorable CLI (`claude-guardian <verb>
+  [<name>]`).
 
 **Non-goals**
 - Installing or updating the Claude Code CLI itself. The operator is
   expected to have it installed and authenticated (or to authenticate
-  interactively through the session this tool manages).
+  interactively through a session this tool manages).
 - Building a remote-access transport from scratch. This tool relies on
   Claude Code's own `--remote-control` feature for the primary remote path,
-  and assumes SSH access to the host as a fallback; it only keeps a `tmux`
-  session alive for either to attach to.
-- Running multiple concurrent named Claude sessions. One default session is
-  the supported configuration (see `DECISIONS.md`, 2026-08-16).
+  and assumes SSH access to the host as a fallback; it only keeps `tmux`
+  sessions alive for either to attach to.
+- A lifecycle control API (HTTP/REST or otherwise) for managing instances
+  remotely. Lifecycle management is CLI-only, driven either over SSH or
+  from inside a Claude Code session this tool itself manages (see
+  `DECISIONS.md`, 2026-08-17, "Rejected").
 - A GUI, web dashboard, or notification system. Status is read via
-  `systemctl status` / `journalctl`.
+  `claude-guardian list` / `systemctl status` / `journalctl`.
 
 ## Architecture
 
-Two independent supervision layers, so that either kind of failure — "the
-`claude` process died" or "the whole supervisor died" — is recovered by a
-different mechanism:
+Every named instance runs the same two independent supervision layers as
+the original single-session design, just parameterized by instance name —
+one systemd unit instance and one tmux session per `claude-guardian
+<name>`, all tmux sessions sharing a single tmux server:
 
 ```
-                     boot / crash of the supervisor itself
+                     boot / crash of one instance's supervisor
                                     |
                                     v
-   systemd (Restart=always) ---> claude-guardian run  (foreground loop)
+   systemd (Restart=always) ---> claude-guardian run <name>  (foreground loop)
+   claude-guardian@<name>.service    |
+   (one instance per name,           | every CHECK_INTERVAL_SEC:
+    from a template unit)            | tmux has-session? / pane_dead? / client attached?
+                                      | (if unattended: nudge Enter / refresh
+                                      |  /remote-control + re-capture its URL —
+                                      |  on their own longer intervals, see below)
+                                      v
+                     tmux session "<name>" (remain-on-exit on)
+                     — one of possibly several, all on the same
+                       tmux server / $TMUX_SOCKET
                                     |
-                                    | every CHECK_INTERVAL_SEC:
-                                    | tmux has-session? / pane_dead? / client attached?
-                                    | (if unattended: nudge Enter / refresh /remote-control
-                                    |  on their own longer intervals — see below)
                                     v
-                     tmux session "claude-code" (remain-on-exit on)
-                                    |
-                                    v
-                    claude --permission-mode auto --remote-control
+        claude --permission-mode auto --remote-control --session-id <uuid>
+        (or --resume <uuid> instead of --session-id, if this instance
+         was created via `claude-guardian resume <archive-id>`)
                                     ^                       ^
                                     |                       |
                         operator: ssh + `claude-guardian     operator: claude.ai
-                        attach` (tmux attach)                web/phone (Remote Control)
+                        attach <name>` (tmux attach)          web/phone (Remote Control) —
+                                                               URL scraped from the pane and
+                                                               stored, so `claude-guardian
+                                                               url <name>` prints it without
+                                                               ever attaching
 ```
 
-- **systemd layer** recovers from: reboot, the supervisor script crashing,
-  the whole tmux server disappearing. `Restart=always` plus a bounded
-  `StartLimitBurst` stop it from spinning forever if `claude` is genuinely
-  missing (see Known limitations). `KillMode=process` so `stop`/`restart`
-  only signals the tracked loop PID, never the tmux server or `claude`
-  (verified live — the default `KillMode=control-group` killed the whole
-  session, which is why this is explicit, not left at the systemd default).
+- **systemd layer** recovers from: reboot, one instance's supervisor
+  script crashing, that instance's tmux server-side state disappearing.
+  `Restart=always` plus a bounded `StartLimitBurst` stop it from spinning
+  forever if `claude` is genuinely missing (see Known limitations).
+  `KillMode=process` so `stop`/`restart`/`deactivate` only signal the
+  tracked loop PID, never the tmux server or `claude` (verified live — the
+  default `KillMode=control-group` killed the whole session, which is why
+  this is explicit, not left at the systemd default). Because it's a
+  *template* unit (`claude-guardian@.service`), each instance is an
+  independent systemd unit instance (`claude-guardian@work.service`,
+  `claude-guardian@personal.service`, ...) that can be individually
+  started, stopped, enabled, or disabled without touching any other
+  instance.
 - **tmux layer** recovers from: the `claude` process itself exiting for any
   reason, while the *session* (its scrollback, its pty) is preserved. This
   is what makes Ctrl+C safe to send inside the session without losing state
   — only `claude` exits and is respawned, the tmux session survives. (Note:
   Claude Code itself treats a single Ctrl+C as "interrupt this turn," not
   exit — it takes two in a row, or `/exit`, to actually terminate the
-  process; verified against the real binary.)
+  process; verified against the real binary.) All instances share one tmux
+  server (one `$TMUX_SOCKET`) with one session per instance, named after
+  the instance — tmux already multiplexes sessions natively, so a second
+  server per instance would add operational overhead for no benefit (see
+  `DECISIONS.md`, 2026-08-17).
+- **session identity**: at creation, each instance is handed either a
+  fresh `claude --session-id <uuid>` (generated via `uuidgen`) or, if it
+  was created by `resume`, `claude --resume <uuid>` pointing at a
+  previously-archived conversation. Either way the id is baked into the
+  tmux pane's original command line, so every `respawn-pane` after a crash
+  automatically reuses the same id — a respawn continues the same
+  conversation, it never silently forks a new one. The id is recorded in
+  per-instance state (`/var/lib/claude-guardian/state/<name>.state`)
+  specifically so `archive` can save it and `resume` can reuse it.
 - **unattended keepalive** (see `DECISIONS.md` 2026-08-16 "always remotely
-  controllable"): when `tmux list-clients` shows nobody attached, the loop
-  periodically (a) sends Enter — twice, one second apart — to clear any
-  confirmation `--permission-mode auto` fell back to after repeated
-  classifier blocks, and (b) re-runs `/remote-control` to refresh the
-  connection before Anthropic's documented ~30-minute "could not reach the
-  Remote Control server" threshold can ever be hit. Both stop immediately
-  once a client attaches (checked every tick). `create_session` sends the
-  same double Enter right after starting `claude`, for the same reason: a
+  controllable"): when `tmux list-clients` shows nobody attached to an
+  instance's session, its loop periodically (a) sends Enter — twice, one
+  second apart — to clear any confirmation `--permission-mode auto` fell
+  back to after repeated classifier blocks, and (b) re-runs
+  `/remote-control` to both refresh the connection before Anthropic's
+  documented ~30-minute "could not reach the Remote Control server"
+  threshold can ever be hit, *and* re-scrape the (possibly changed)
+  `claude.ai/code/...` URL into instance state. Both stop immediately once
+  a client attaches (checked every tick). `create_session` sends the same
+  double Enter right after starting `claude`, for the same reason: a
   genuinely first-ever run can show an onboarding/trust screen that needs
   two Enters to clear, and that shouldn't have to wait for the first
-  unattended-nudge interval to pass. A second Enter once `claude` is
-  already sitting at its normal prompt is a harmless no-op either way, so
-  there's no downside to always sending two instead of trying to detect
-  which screen is showing.
-- The two layers are deliberately independent: `systemctl stop
-  claude-guardian` only stops the *supervision loop*; it does not kill the
-  live tmux session, so an operator who is mid-conversation is not cut off
-  by routine maintenance. Full teardown is a separate, explicit step —
-  `uninstall` (systemd only, session/config left alone, for routine
-  maintenance) vs. `purge` (everything: session, socket, config directory,
-  installed binary — an explicit, deliberate "remove it all" command, see
-  README).
+  unattended-nudge interval to pass — then does one synchronous
+  `/remote-control` capture of its own, so `new` can print the URL
+  immediately instead of waiting up to `REMOTE_CONTROL_REFRESH_SEC` for
+  the first periodic refresh. A second Enter once `claude` is already
+  sitting at its normal prompt is a harmless no-op either way, so there's
+  no downside to always sending two instead of trying to detect which
+  screen is showing.
+- The two layers are deliberately independent per instance:
+  `claude-guardian deactivate <name>` (`systemctl disable --now`) only
+  stops that instance's *supervision loop*; it does not kill its live
+  tmux session, so an operator who is mid-conversation is not cut off by
+  routine maintenance — `activate <name>` resumes supervision against the
+  same, still-running session. Full teardown of one instance is a
+  separate, explicit, destructive step: `archive <name>` (see below).
+  Full teardown of the *tool* is `uninstall` (systemd template only,
+  every instance's config/session left alone) vs. `purge` (everything:
+  every session, the socket, every config, the installed binary — but
+  never `/var/lib/claude-guardian/archive/`, see README).
+- **archive / resume**: `archive <name>` stops supervision, captures the
+  full scrollback (`tmux capture-pane -pS -`) and the instance's
+  `claude_session_id` to `/var/lib/claude-guardian/archive/<name>-<ts>/`,
+  then kills the tmux session — a deliberate, confirmed-by-default
+  destructive operation (see `DECISIONS.md`, 2026-08-17, "archive kills
+  the process"). `resume <archive-id> [new-name]` recreates an instance
+  from that archive with `RESUME_SESSION_ID` set, so `create_session`
+  passes `--resume <uuid>` instead of minting a new one — the operator
+  picks back up in the same conversation.
 
 ## Tech stack
 
@@ -136,46 +201,53 @@ Rejected alternatives and the reasoning behind each choice live in
 | Item | Source | Placed at |
 |---|---|---|
 | `claude` (Claude Code CLI) | installed and authenticated by the operator beforehand — this tool does not install it | anywhere on `root`'s `PATH`, or point `CLAUDE_BIN` at an absolute path |
+| `uuidgen` (`uuid-runtime` package) | auto-installed by preflight if missing, like `tmux` | used once per instance creation/resume to mint or reuse a `claude --session-id`/`--resume` value |
 
 ### Paths & mounts
 
-Every path below is configurable in `/etc/claude-guardian/config.env` (written by `claude-guardian install` on first run); none are hardcoded in the script.
+Every path below is configurable only via the constants near the top of `bin/claude-guardian.sh` (not runtime config — these are deployment topology, not per-instance behavior); none are hardcoded elsewhere in the script.
 
 | Path | Provided by | Purpose |
 |---|---|---|
-| `/etc/claude-guardian/config.env` | this tool, on first `install` | runtime configuration (see below) |
-| `/etc/systemd/system/claude-guardian.service` | this tool, on `install` | systemd unit definition |
+| `/etc/claude-guardian/config.env` | this tool, on first `install` | global runtime configuration, shared by every instance (see below) |
+| `/etc/claude-guardian/instances/<name>.env` | this tool, on `new`/`resume` | per-instance overrides: `WORKDIR`, `CLAUDE_ARGS`, `CLAUDE_BIN`, and (if resumed) `RESUME_SESSION_ID` |
+| `/etc/systemd/system/claude-guardian@.service` | this tool, on `install` | systemd **template** unit — `claude-guardian@<name>.service` is one instance of it per running instance |
+| `/var/lib/claude-guardian/state/<name>.state` | this tool, at runtime | per-instance runtime state: `claude_session_id`, `workdir`, `created_at`, `remote_url`, `remote_url_updated_at` |
+| `/var/lib/claude-guardian/archive/<name>-<timestamp>/` | this tool, on `archive` | one directory per archived instance: `scrollback.txt`, `meta.env`, `instance.env` |
 | `/usr/local/bin/claude-guardian` | this tool, on `install` (copied from `bin/claude-guardian.sh`) | the installed CLI entry point |
-| `$TMUX_SOCKET` (default `/run/claude-guardian/tmux.sock`) | this tool, created at runtime | dedicated tmux server socket, isolated from any interactive admin's own tmux server on `/tmp` |
-| `$WORKDIR` (default `/root`) | operator, via config | working directory `claude` starts in |
+| `$TMUX_SOCKET` (default `/run/claude-guardian/tmux.sock`) | this tool, created at runtime | one dedicated tmux server socket shared by every instance, isolated from any interactive admin's own tmux server on `/tmp` |
+| `$WORKDIR` (default `/root`, overridable per instance) | operator, via config or `new --workdir` | working directory `claude` starts in |
 
 ### Configuration reference
 
-All variables live in `/etc/claude-guardian/config.env`, a plain `KEY="value"` shell file sourced by the script. The repo's `.env.example` documents the same defaults for reference (this project has no separate app-level `.env` — the installed config file *is* the runtime configuration).
+Global variables live in `/etc/claude-guardian/config.env`, a plain `KEY="value"` shell file sourced first. Per-instance overrides (`WORKDIR`, `CLAUDE_ARGS`, `CLAUDE_BIN`) live in `/etc/claude-guardian/instances/<name>.env`, sourced on top for that instance only — see `new --workdir`/`--args`/`--claude-bin`. The repo's `.env.example` documents the global defaults for reference (this project has no separate app-level `.env` — the installed config file *is* the runtime configuration).
 
-| Variable | Meaning | Default | Required |
-|---|---|---|---|
-| `SESSION_NAME` | tmux session name hosting `claude` | `claude-code` | no |
-| `TMUX_SOCKET` | dedicated tmux server socket path | `/run/claude-guardian/tmux.sock` | no |
-| `WORKDIR` | working directory `claude` starts in | `/root` | no |
-| `CLAUDE_BIN` | `claude` executable name or absolute path | `claude` | no |
-| `CLAUDE_ARGS` | extra CLI args passed on every (re)start | `--permission-mode auto --remote-control` | no |
-| `CHECK_INTERVAL_SEC` | seconds between liveness checks | `5` | no |
-| `REQUIRED_APT_PKGS` | space-separated apt packages auto-installed if missing | `tmux` | no |
-| `UNATTENDED_NUDGE_SEC` | unattended-only: seconds of no attached tmux client before sending a bare Enter to clear a stuck confirmation prompt; `0` disables | `300` | no |
-| `REMOTE_CONTROL_REFRESH_SEC` | unattended-only: seconds of no attached tmux client before re-running `/remote-control` to refresh the connection; `0` disables | `1200` | no |
+| Variable | Meaning | Default | Scope | Required |
+|---|---|---|---|---|
+| `TMUX_SOCKET` | shared tmux server socket path | `/run/claude-guardian/tmux.sock` | global | no |
+| `WORKDIR` | working directory `claude` starts in | `/root` | global, overridable per instance | no |
+| `CLAUDE_BIN` | `claude` executable name or absolute path | `claude` | global, overridable per instance | no |
+| `CLAUDE_ARGS` | extra CLI args passed on every (re)start | `--permission-mode auto --remote-control` | global, overridable per instance | no |
+| `CHECK_INTERVAL_SEC` | seconds between liveness checks | `5` | global | no |
+| `REQUIRED_APT_PKGS` | space-separated apt packages auto-installed if missing | `tmux uuid-runtime` | global | no |
+| `UNATTENDED_NUDGE_SEC` | unattended-only: seconds of no attached tmux client before sending a bare Enter to clear a stuck confirmation prompt; `0` disables | `300` | global | no |
+| `REMOTE_CONTROL_REFRESH_SEC` | unattended-only: seconds of no attached tmux client before re-running `/remote-control` to refresh the connection and re-capture its URL; `0` disables | `1200` | global | no |
+| `MAX_SESSIONS` | `new`/`resume` refuse once this many instances already exist | `3` | global | no |
 
 ## Setup from scratch
 
 1. Clone the repo (a tag, not the branch tip) onto the target Debian server, as root — verify: `git clone ...` exits 0 and `bin/claude-guardian.sh` exists.
 2. `bash bin/claude-guardian.sh check` — verify: prints the three check sections (`apt dependencies`, `claude CLI`, `login state`) with `[ok]`/`[missing]`/`[warn]` markers and does not modify anything.
-3. `bash bin/claude-guardian.sh install` — verify: ends with `install complete`; `systemctl is-enabled claude-guardian` prints `enabled`.
-4. `claude-guardian start` — verify: `systemctl is-active claude-guardian` prints `active`.
-5. `claude-guardian attach` — verify: drops you into a live `claude` terminal inside tmux, and the pane shows a `/remote-control is active ... https://claude.ai/code/session_...` line — that URL is controllable from the web or a phone independent of this SSH session. Detach with the tmux prefix (default `Ctrl+b`) then `d` — **not** Ctrl+C.
-6. From a second terminal, actually exit `claude` from inside the session and verify the respawn — e.g. `tmux -S /run/claude-guardian/tmux.sock send-keys -t claude-code C-c C-c` (Claude Code treats a single Ctrl+C as "interrupt current turn," matching most REPLs; it takes two in quick succession to actually exit, same as typing `/exit`). Verify: within `CHECK_INTERVAL_SEC`, `claude-guardian logs` shows a `respawning automatically` line, the `claude` PID (`pgrep -f 'claude --permission-mode'`) has changed, and `claude-guardian attach` shows a live session again (with a new remote-control URL).
-7. `systemctl stop claude-guardian` then check `pgrep -f 'claude --permission-mode'` — verify: the process is still running (stop only pauses supervision, see Known limitations on `KillMode`). `claude-guardian start` again — verify: the same `claude` PID is still there (supervision resumes against the existing session instead of recreating it).
-8. Detach and leave the session unattended for longer than `UNATTENDED_NUDGE_SEC` — verify: `claude-guardian logs` shows a `sending Enter in case a prompt is stuck` line at that mark, and (after `REMOTE_CONTROL_REFRESH_SEC`) a `refreshing remote control connection` line, and neither fires again immediately after you reattach and detach once more (timers reset on attach).
-9. `reboot` the host — verify: after boot, `systemctl is-active claude-guardian` is `active` again without manual intervention.
+3. `bash bin/claude-guardian.sh install` — verify: ends with `install complete`; `systemctl is-enabled claude-guardian@claude-code` prints `enabled` (the default instance is created and enabled automatically).
+4. `claude-guardian start` — verify: `systemctl is-active claude-guardian@claude-code` prints `active`.
+5. `claude-guardian attach` — verify: drops you into a live `claude` terminal inside tmux (name defaults to `claude-code`), and the pane shows a `/remote-control is active ... https://claude.ai/code/session_...` line — that URL is controllable from the web or a phone independent of this SSH session, and is also printed by `claude-guardian url claude-code` without attaching at all. Detach with the tmux prefix (default `Ctrl+b`) then `d` — **not** Ctrl+C.
+6. `claude-guardian new second-instance` — verify: `claude-guardian list` shows two rows (`claude-code`, `second-instance`), each with its own `SYSTEMD`/`TMUX`/`URL` columns, confirming both are independently supervised and remotely controllable.
+7. From a second terminal, actually exit `claude` from inside a session and verify the respawn — e.g. `tmux -S /run/claude-guardian/tmux.sock send-keys -t claude-code C-c C-c` (Claude Code treats a single Ctrl+C as "interrupt current turn," matching most REPLs; it takes two in quick succession to actually exit, same as typing `/exit`). Verify: within `CHECK_INTERVAL_SEC`, `claude-guardian logs claude-code` shows a `respawning automatically` line, the `claude` PID (`pgrep -f 'claude --permission-mode'`) has changed for that instance, and `claude-guardian attach` shows a live session again (with a newly re-captured remote-control URL).
+8. `claude-guardian deactivate second-instance` then check `pgrep -f 'claude --permission-mode'` — verify: both `claude` processes are still running (deactivate only pauses supervision, see Known limitations on `KillMode`). `claude-guardian activate second-instance` again — verify: the same `claude` PID for that instance is still there (supervision resumes against the existing session instead of recreating it).
+9. `claude-guardian archive second-instance --yes` — verify: `claude-guardian list` no longer shows `second-instance`; `claude-guardian archives` shows one entry for it with a saved `scrollback.txt`; `pgrep -f 'claude --permission-mode'` shows only the `claude-code` process remains.
+10. `claude-guardian resume second-instance` (or the exact archive id from step 9) — verify: `claude-guardian list` shows `second-instance` again, and `claude-guardian attach second-instance` continues the same conversation instead of starting fresh.
+11. Detach from `claude-code` and leave it unattended for longer than `UNATTENDED_NUDGE_SEC` — verify: `claude-guardian logs claude-code` shows a `sending Enter in case a prompt is stuck` line at that mark, and (after `REMOTE_CONTROL_REFRESH_SEC`) a `refreshing remote control connection` line, and neither fires again immediately after you reattach and detach once more (timers reset on attach).
+12. `reboot` the host — verify: after boot, every instance that was `activate`d (not `deactivate`d) is `active` again without manual intervention.
 
 This project is not deployed with Docker; steps above are the full deployment procedure.
 
@@ -186,7 +258,7 @@ repo/
 ├── bin/claude-guardian.sh   # the entire tool — self-contained, no other source files
 ├── README.md / README.zh.md
 ├── DESIGN.md / DESIGN.zh.md
-├── .env.example             # documents the config.env variables (see Configuration reference)
+├── .env.example             # documents the global config.env variables (see Configuration reference)
 └── ...
 ```
 
@@ -214,30 +286,66 @@ sufficient, without needing the rest of the repo.
   documented alternative is `--permission-mode dontAsk` with an explicit
   `permissions.allow` list, which denies unlisted actions silently instead
   of guessing at a confirmation dialog (more predictable, more setup work).
-- **`claude-guardian install` auto-installs missing apt packages
+- **`claude-guardian install`/`new` auto-install missing apt packages
   non-interactively** (`DEBIAN_FRONTEND=noninteractive apt-get install -y`).
-  By default this is just `tmux`. If you widen `REQUIRED_APT_PKGS`, review
-  what you are asking it to install unattended.
-- **Missing `claude` binary makes the service fail-loop for about a minute,
-  then stop.** `preflight_enforce` hard-fails if `claude` is not found (by
-  design — this tool never installs it). `StartLimitBurst=10` /
+  By default this is `tmux` and `uuid-runtime`. If you widen
+  `REQUIRED_APT_PKGS`, review what you are asking it to install unattended.
+- **Missing `claude` binary makes an instance's service fail-loop for about
+  a minute, then stop.** `preflight_enforce` hard-fails if `claude` is not
+  found (by design — this tool never installs it). `StartLimitBurst=10` /
   `StartLimitIntervalSec=60` in the unit stop systemd from restarting
-  forever; after that the service sits in `failed` state until you install
-  `claude` and run `systemctl reset-failed claude-guardian && systemctl
-  start claude-guardian`.
-- **`systemctl stop claude-guardian` does not kill the live session — this
-  required `KillMode=process` in the unit, verified against the real
-  binary.** systemd's *default* `KillMode` is `control-group`, which would
-  SIGTERM the entire cgroup on stop/restart, including the tmux server and
-  `claude` itself (this was caught live: the first version of the unit had
-  no explicit `KillMode` and a `systemctl restart` silently killed and
-  recreated the session). With `KillMode=process`, only the tracked loop
-  PID is signaled, so `claude` and its tmux session survive a
-  `stop`/`restart` of the supervisor. One side effect: systemd logs a
-  benign `Found left-over process ... in control group` notice on the next
-  `start`, because the previous `claude` process is still in the cgroup —
-  this is expected, not an error. To fully tear down, run `claude-guardian
-  purge` (or manually: `tmux -S $TMUX_SOCKET kill-session -t $SESSION_NAME`).
+  forever; after that the instance sits in `failed` state until you install
+  `claude` and run `systemctl reset-failed claude-guardian@<name> &&
+  claude-guardian start <name>`.
+- **`claude-guardian deactivate <name>` (`systemctl disable --now`) does
+  not kill the live session — this required `KillMode=process` in the unit,
+  verified against the real binary.** systemd's *default* `KillMode` is
+  `control-group`, which would SIGTERM the entire cgroup on stop/restart,
+  including the tmux server and `claude` itself (this was caught live: the
+  first version of the unit had no explicit `KillMode` and a `systemctl
+  restart` silently killed and recreated the session). With
+  `KillMode=process`, only the tracked loop PID is signaled, so `claude`
+  and its tmux session survive a `stop`/`restart`/`deactivate` of that
+  instance's supervisor. One side effect: systemd logs a benign `Found
+  left-over process ... in control group` notice on the next `start`,
+  because the previous `claude` process is still in the cgroup — this is
+  expected, not an error. To actually end one instance's conversation, use
+  `claude-guardian archive <name>` (destructive, confirmed by default); to
+  tear down everything, `claude-guardian purge` (also confirmed by
+  default, and does not touch archives — see below).
+- **`purge`'s blast radius grew from "one session" to "every live
+  instance"** when multi-instance support was added (see `DECISIONS.md`,
+  2026-08-17). It now prints the live instance count and requires
+  interactive confirmation (or `--yes`) before killing anything, and
+  deliberately never deletes `/var/lib/claude-guardian/archive/` — remove
+  individual archives explicitly with `rm-archive` if you want them gone
+  too.
+- **Capturing the remote-control URL sends literal keystrokes
+  (`C-u`, `/remote-control`, `Enter`) into the tmux pane** — at instance
+  creation (right after the onboarding double-Enter) and on every
+  unattended refresh. If `claude` is, unexpectedly, still on a screen
+  other than its normal prompt at that exact moment (e.g. an onboarding
+  step beyond the two Enters already sent), those keystrokes can be typed
+  into the wrong place — harmless (nothing is auto-confirmed by this
+  specific step) but may leave stray text that needs clearing manually via
+  `claude-guardian attach <name>`. This is the same class of "blind
+  keystroke" tradeoff already accepted for the double-Enter onboarding
+  clear and the unattended nudge; see the `UNATTENDED_NUDGE_SEC` entry
+  above.
+- **`resume` can only reconstruct a conversation if the archive has a
+  recorded `claude_session_id`.** This is always true for archives created
+  by this tool's own `archive` command (the id is captured at instance
+  creation and carried through), but if an archive directory is ever
+  hand-edited or `meta.env` is lost, `resume` refuses and points at the
+  raw `scrollback.txt` instead of guessing.
+- **`install` migrates a v0.1.0 single-instance deployment in place**
+  (`migrate_legacy_unit`): it disables/removes the old
+  `claude-guardian.service` and enables the new
+  `claude-guardian@claude-code.service` against the *same* tmux session.
+  This relies on `KillMode=process` in both the old and new unit to be
+  true (verified above) — if a future systemd unit change ever drops that
+  setting, this migration path would need re-verification against a live
+  session before being trusted again.
 - **Detach with the tmux prefix, not Ctrl+C — and a single Ctrl+C does not
   kill `claude` anyway.** Verified against the real CLI: Claude Code treats
   one Ctrl+C as "interrupt the current turn" (like most REPLs), not exit —
@@ -286,14 +394,21 @@ sufficient, without needing the rest of the repo.
 
 - **New preflight checks** go in both `preflight_report` (report-only) and
   `preflight_enforce` (may mutate / hard-fail) — keep the two in sync so
-  `check` accurately previews what `run`/`install` will do.
-- **Supporting more than one named session** would mean turning the systemd
-  unit into a template (`claude-guardian@%i.service`), keyed by session
-  name, with per-instance config at
-  `/etc/claude-guardian/<name>.env`. Deliberately not built (see
-  `DECISIONS.md`, 2026-08-16) — add it only if a real need for concurrent
-  sessions shows up, not speculatively.
-- **Config variables** are added by extending both the default block near
-  the top of `bin/claude-guardian.sh` and the heredoc in
+  `check` accurately previews what `run`/`install`/`new` will do.
+- **New global config variables** are added by extending both the default
+  block near the top of `bin/claude-guardian.sh` and the heredoc in
   `write_default_config`, plus a row in this document's Configuration
-  reference table and in `.env.example`.
+  reference table and in `.env.example`. **New per-instance overrides**
+  instead go through `write_instance_file` and a new `new --flag` option —
+  keep the set small; `WORKDIR`/`CLAUDE_ARGS`/`CLAUDE_BIN` were chosen
+  because they're the only knobs a real per-instance need has come up for
+  (see `DECISIONS.md`, 2026-08-17).
+- **A per-instance TMUX_SOCKET or an HTTP control API** were both
+  considered and rejected when multi-instance support was added — see
+  `DECISIONS.md`, 2026-08-17, "Rejected", before reintroducing either.
+- **New instance-lifecycle subcommands** should follow the existing
+  pattern: read/write state only through `instance_file`/`state_get`/
+  `state_set`, never touch another instance's files, and update `usage()`
+  (the comment block) and the `main()` case statement together — `usage()`
+  is generated from that comment block via `sed`, so drift between the two
+  is not possible as long as both are edited in the same change.
