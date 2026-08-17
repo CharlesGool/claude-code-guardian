@@ -42,6 +42,16 @@ bash bin/claude-guardian.sh install
 
 `install` runs the preflight checks, writes a default global config to `/etc/claude-guardian/config.env`, installs the script to `/usr/local/bin/claude-guardian`, writes the systemd **instance template** (`claude-guardian@.service`), and creates + enables one default instance named `claude-code`. It does not start it — that's the next step. Upgrading from a v0.1.0 install migrates its single session onto the new template automatically, without killing the live `claude` process.
 
+### Optional: the `claude-session` skill
+
+`skills/claude-session/` is an Agent Skill that teaches Claude Code to drive these commands from plain language ("开一个常驻对话", "list my sessions", "archive this one") instead of you remembering the CLI. It also encodes the destructive-command rules — `archive` and `purge` kill live `claude` processes, so the skill requires an explicit request naming that action before it will run either.
+
+```bash
+cp -r skills/claude-session ~/.claude/skills/
+```
+
+Optional, and it changes nothing about the tool itself: `claude-guardian` works identically without it.
+
 ## Quick start
 
 ```bash
