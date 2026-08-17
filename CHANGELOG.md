@@ -4,6 +4,49 @@ Newest version first. Only changes a user can perceive — internal refactors do
 not need an entry. Draft from `git log <previous-tag>..HEAD --oneline`, then
 rewrite in user-facing terms.
 
+## v0.3.0 — unreleased
+
+Remote Control now actually gets repaired when it drops, and the URL an
+instance reports is guaranteed to be its own. See DECISIONS.md, 2026-08-17
+("read Remote Control state from claude's own session file"), for how these
+were found and why the approach changed.
+
+### Fixed
+- **Instances no longer sit disconnected until someone notices.** The
+  unattended keepalive re-ran `/remote-control` on a timer believing that
+  refreshed the connection; it does not — on an already-connected session
+  that command only opens an informational dialog. A dropped Remote Control
+  connection was therefore never repaired. The supervisor now checks
+  whether the connection is genuinely up and reconnects only if it isn't.
+- **`url` / `list` could report another instance's URL.** The URL was found
+  by grepping the terminal for any `claude.ai/code/session_...` link, so a
+  link that merely happened to be on screen — another instance's, one in a
+  commit message, one echoed by a command — could be recorded as this
+  instance's own. Observed in production. The URL now comes from the
+  session's own state, and the terminal fallback is anchored to the
+  `/remote-control` output.
+- **The supervisor no longer types into healthy sessions.** Remote Control
+  is not a tmux client, so a session being driven from claude.ai looked
+  unattended and received a `/remote-control` line as a user turn every
+  `REMOTE_CONTROL_REFRESH_SEC`. The connection check is now a file read;
+  keys are sent only to perform an actual reconnect.
+
+### Changed
+- `REMOTE_CONTROL_REFRESH_SEC` now means "how often to check that Remote
+  Control is still connected" rather than "how often to re-run
+  `/remote-control`". Same default (`1200`); it now bounds how long a
+  dropped connection can go unnoticed.
+- `url <name>` and `list` report the instance's *current* URL rather than
+  the last one stored. Reconnecting mints a new URL, so fetch it when you
+  need it instead of bookmarking it; `url` warns when an instance is
+  disconnected and the link it has is probably dead.
+
+### Added
+- `CLAUDE_SESSIONS_DIR` (default
+  `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions`): where Claude Code writes
+  its per-session files. Read-only, and only needs setting if Claude Code
+  uses a non-default config directory.
+
 ## v0.2.0 — 2026-08-17
 
 `claude-guardian` now supervises multiple named, concurrent Claude Code

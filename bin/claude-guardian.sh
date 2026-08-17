@@ -81,13 +81,18 @@ REQUIRED_APT_PKGS="tmux uuid-runtime"
 # Enter keystroke to clear any confirmation prompt auto mode fell back to
 # after repeated classifier blocks. 0 disables. See DESIGN.md Known limitations.
 UNATTENDED_NUDGE_SEC="300"
-# When nobody is attached for this many seconds, proactively re-run
-# /remote-control to refresh the connection — Anthropic's docs say a Remote
-# Control session that can't reach the server for ~30 minutes needs a manual
-# /remote-control to reconnect; refreshing well inside that window avoids
-# ever hitting it. Also re-captures the claude.ai URL into instance state.
-# 0 disables.
+# How often to check that Remote Control is still connected, and reconnect
+# it if it isn't. The check itself is passive (it reads claude's own session
+# file, see CLAUDE_SESSIONS_DIR) and types nothing into the session; only an
+# actual reconnect sends /remote-control. 0 disables.
 REMOTE_CONTROL_REFRESH_SEC="1200"
+# Claude Code writes one JSON file per running session here, named after that
+# session's PID, with a "bridgeSessionId" field holding the Remote Control
+# session id while connected (null once disconnected). That file is the
+# authoritative answer to both "is it still connected?" and "what is the
+# claude.ai URL?" — see DECISIONS.md for why it replaced scraping the
+# terminal, and DESIGN.md for the fallback when the file is absent.
+CLAUDE_SESSIONS_DIR="${CLAUDE_CONFIG_DIR:-${HOME:-/root}/.claude}/sessions"
 # `new` refuses once this many instances already exist — each concurrent
 # instance is a separate claude process and a separate token cost.
 MAX_SESSIONS="3"
@@ -346,12 +351,15 @@ create_session() {
   sleep 1
   tmux_cmd send-keys -t "$name" Enter
 
-  # Best-effort: capture the remote-control URL right away so `new` can
-  # print it immediately instead of waiting for the first periodic
-  # refresh (up to REMOTE_CONTROL_REFRESH_SEC later). If claude is still
-  # mid-onboarding beyond the two Enters above, this can type "/remote-
-  # control" into the wrong screen — harmless but may need a manual
-  # '/remote-control' afterwards; see DESIGN.md Known limitations.
+  # Best-effort: record the remote-control URL right away so `new` can print
+  # it immediately instead of waiting for the first periodic check (up to
+  # REMOTE_CONTROL_REFRESH_SEC later). claude was started with
+  # --remote-control, so this normally just reads its session file and types
+  # nothing. It can still fall through to sending /remote-control if that
+  # file has not appeared yet — and if claude is meanwhile still
+  # mid-onboarding beyond the two Enters above, that lands on the wrong
+  # screen; harmless, but it may need a manual '/remote-control' afterwards.
+  # See DESIGN.md Known limitations.
   sleep 1
   capture_remote_control_url "$name" || true
 }
@@ -377,34 +385,114 @@ nudge_enter() {
   tmux_cmd send-keys -t "$name" Enter
 }
 
-# Sends /remote-control, waits for the resulting status screen, scrapes the
-# https://claude.ai/code/session_... URL out of the visible pane, stores it
-# in instance state (see `claude-guardian url <name>`), then sends Enter to
-# dismiss the screen (its default-highlighted option is "Continue").
-capture_remote_control_url() {
-  local name="$1" url
-  tmux_cmd send-keys -t "$name" C-u
-  tmux_cmd send-keys -t "$name" "/remote-control" Enter
-  sleep 2
-  url=$(tmux_cmd capture-pane -p -t "$name" 2>/dev/null \
-    | grep -oE 'https://claude\.ai/code/session_[A-Za-z0-9_-]+' | tail -n1)
-  tmux_cmd send-keys -t "$name" Enter
-  if [ -n "$url" ]; then
-    state_set "$name" remote_url "$url"
-    state_set "$name" remote_url_updated_at "$(date -Iseconds)"
-    log "remote control URL for '$name': $url"
-  else
-    log "warning: could not capture a remote-control URL for '$name' — check manually with '$PROG_NAME attach $name'"
-  fi
+# PID of an instance's claude process. create_session execs claude as the
+# pane command itself, so the pane PID is claude's own PID, which is also
+# what its file in $CLAUDE_SESSIONS_DIR is named after.
+instance_pid() {
+  tmux_cmd list-panes -t "$1" -F '#{pane_pid}' 2>/dev/null | head -n1
 }
 
-# Remote Control sessions that can't reach the server for ~30 minutes need a
-# manual /remote-control to reconnect (Anthropic docs). Refresh proactively,
-# comfortably inside that window, so it's never actually hit — and re-store
-# the (possibly changed) URL while we're there.
+# Reads the Remote Control session id out of claude's own session file.
+# Prints the claude.ai URL and returns 0 while connected; returns 1 when
+# disconnected, when the file is missing (a Claude Code that doesn't write
+# one), or when it turns out to describe some other session.
+#
+# No jq/python dependency on purpose — the fields are matched textually, and
+# a disconnected session writes `"bridgeSessionId": null`, which cannot
+# match a quoted-string pattern.
+bridge_url_of() {
+  local name="$1" pid f bridge tracked recorded
+  pid=$(instance_pid "$name")
+  [ -n "$pid" ] || return 1
+  f="$CLAUDE_SESSIONS_DIR/$pid.json"
+  [ -r "$f" ] || return 1
+
+  # Guard against PID reuse handing back a stale file: it must name this PID
+  # and — when we know which claude session this instance owns — that
+  # session too. Instances migrated from v0.1.0 have no tracked session id
+  # (see DESIGN.md), and an empty one skips just that half of the check.
+  recorded=$(grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9][0-9]*' "$f" | grep -o '[0-9][0-9]*$')
+  [ "$recorded" = "$pid" ] || return 1
+  tracked=$(state_get "$name" claude_session_id)
+  if [ -n "$tracked" ] \
+     && ! grep -q "\"sessionId\"[[:space:]]*:[[:space:]]*\"$tracked\"" "$f"; then
+    return 1
+  fi
+
+  bridge=$(grep -o '"bridgeSessionId"[[:space:]]*:[[:space:]]*"session_[A-Za-z0-9_-]*"' "$f" \
+    | sed 's/.*"\(session_[A-Za-z0-9_-]*\)".*/\1/')
+  [ -n "$bridge" ] || return 1
+  echo "https://claude.ai/code/$bridge"
+}
+
+store_remote_url() {
+  local name="$1" url="$2"
+  state_set "$name" remote_url "$url"
+  state_set "$name" remote_url_updated_at "$(date -Iseconds)"
+}
+
+# Records the instance's Remote Control URL, turning Remote Control back on
+# first if it is off. Typing into the session is the last resort here, not
+# the first move: claude is started with --remote-control, so on a healthy
+# instance the URL is already readable from its session file and nothing is
+# sent to the session at all.
+capture_remote_control_url() {
+  local name="$1" url
+
+  if url=$(bridge_url_of "$name"); then
+    store_remote_url "$name" "$url"
+    log "remote control URL for '$name': $url"
+    return 0
+  fi
+
+  # /remote-control turns Remote Control on when it is off. When it is
+  # already on it instead opens an informational dialog offering "Disconnect
+  # this session" / "Show QR code" / "Continue"; Escape closes that dialog
+  # without selecting anything, so this is safe in both states.
+  log "remote control not connected for '$name' — sending /remote-control to (re)connect"
+  tmux_cmd send-keys -t "$name" C-u
+  tmux_cmd send-keys -t "$name" "/remote-control" Enter
+  sleep 3
+  tmux_cmd send-keys -t "$name" Escape
+
+  if url=$(bridge_url_of "$name"); then
+    store_remote_url "$name" "$url"
+    log "remote control URL for '$name': $url"
+    return 0
+  fi
+
+  # Fallback for a Claude Code that writes no session file: read the URL off
+  # the screen. Anchored to the /remote-control output rather than grepping
+  # the whole pane, so a link that merely happens to be visible — another
+  # instance's URL echoed by some command, a session URL in a commit message
+  # — cannot be mistaken for this session's own. That confusion is not
+  # hypothetical; see DECISIONS.md.
+  url=$(tmux_cmd capture-pane -p -t "$name" 2>/dev/null \
+    | grep -A2 -E '/remote-control is active|This session is available' \
+    | grep -oE 'https://claude\.ai/code/session_[A-Za-z0-9_-]+' | tail -n1)
+  if [ -n "$url" ]; then
+    store_remote_url "$name" "$url"
+    log "remote control URL for '$name' (read from the terminal; no usable entry in $CLAUDE_SESSIONS_DIR): $url"
+    return 0
+  fi
+
+  log "warning: could not determine a remote-control URL for '$name' — check manually with '$PROG_NAME attach $name'"
+  return 1
+}
+
+# Remote Control does drop on its own — the server times a session out, the
+# network goes away — and nothing announces that in the terminal, so the
+# only way to know is to look. Re-running /remote-control on a session that
+# still believes it is connected does NOT re-establish anything; it just
+# opens the informational dialog. That is why this checks first (passively,
+# typing nothing) and only sends keys when genuinely disconnected.
 refresh_remote_control() {
-  local name="$1"
-  log "no attached client for ${REMOTE_CONTROL_REFRESH_SEC}s+ — refreshing remote control connection"
+  local name="$1" url
+  if url=$(bridge_url_of "$name"); then
+    store_remote_url "$name" "$url"
+    return 0
+  fi
+  log "remote control disconnected for '$name' — reconnecting"
   capture_remote_control_url "$name"
 }
 
@@ -501,12 +589,18 @@ REQUIRED_APT_PKGS="tmux uuid-runtime"
 # 0 disables.
 UNATTENDED_NUDGE_SEC="300"
 
-# when nobody is attached this many seconds, proactively re-run
-# /remote-control to refresh the connection before Anthropic's ~30-minute
-# "could not reach the Remote Control server" threshold is ever hit, and
-# re-capture the claude.ai URL (see `claude-guardian url <name>`).
+# how often to check that Remote Control is still connected and reconnect it
+# if it isn't, refreshing the stored claude.ai URL either way (see
+# `claude-guardian url <name>`). The check reads claude's own session file
+# and types nothing into the session; only a real reconnect sends keys.
 # 0 disables.
 REMOTE_CONTROL_REFRESH_SEC="1200"
+
+# where Claude Code writes its per-session JSON files, one per running
+# session, named after that session's PID. Read-only; it is what makes the
+# connected/disconnected check above possible. Override only if Claude Code
+# is configured with a non-default CLAUDE_CONFIG_DIR.
+CLAUDE_SESSIONS_DIR="${CLAUDE_CONFIG_DIR:-${HOME:-/root}/.claude}/sessions"
 
 # `new` refuses once this many instances already exist — each concurrent
 # instance is a separate claude process and a separate token cost.
@@ -684,7 +778,10 @@ cmd_list() {
     fi
     workdir=$(state_get "$name" workdir)
     [ -n "$workdir" ] || workdir="-"
-    url=$(state_get "$name" remote_url)
+    # Live value first, stored one only as a fallback: the URL changes every
+    # time Remote Control reconnects, so state is only as fresh as the last
+    # check the supervisor ran.
+    url=$(bridge_url_of "$name") || url=$(state_get "$name" remote_url)
     [ -n "$url" ] || url="(not captured yet — try '$PROG_NAME url $name')"
     printf '%-16s %-10s %-6s %-10s %-22s %s\n' "$name" "$active" "$tmux_state" "$attached" "$workdir" "$url"
   done <<< "$files"
@@ -694,14 +791,22 @@ cmd_url() {
   local name="${1:-$DEFAULT_INSTANCE}"
   instance_exists "$name" || die "no such instance '$name' ($PROG_NAME list)"
   local url
+  # Ask the live session first — a reconnect mints a new URL, so whatever is
+  # in state is only as fresh as the last check the supervisor ran.
+  if url=$(bridge_url_of "$name"); then
+    store_remote_url "$name" "$url"
+    echo "$url"
+    return 0
+  fi
+
   url=$(state_get "$name" remote_url)
   if [ -n "$url" ]; then
     echo "$url"
     local ts
     ts=$(state_get "$name" remote_url_updated_at)
-    [ -n "$ts" ] && log "captured at $ts"
+    log "warning: remote control is not connected for '$name' right now, so this link is probably dead${ts:+ (last verified $ts)}. The supervisor reconnects within ${REMOTE_CONTROL_REFRESH_SEC}s and the new link will show up here; follow it with '$PROG_NAME logs $name'."
   else
-    die "no URL captured yet for '$name'. It's captured automatically on creation and every REMOTE_CONTROL_REFRESH_SEC while unattended; check '$PROG_NAME logs $name', or attach and run /remote-control yourself."
+    die "no URL known yet for '$name'. It's recorded on creation and re-checked every ${REMOTE_CONTROL_REFRESH_SEC}s; check '$PROG_NAME logs $name', or attach and run /remote-control yourself."
   fi
 }
 

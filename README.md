@@ -7,10 +7,10 @@ Keeps one or more named, remotely-attachable Claude Code (`claude`) sessions ali
 ## What it does
 
 - Installs a systemd **instance template** that supervises one dedicated `tmux` session per named instance, each running `claude --permission-mode auto --remote-control` by default — remote control means you can take any instance over from **claude.ai on the web or your phone**, not just SSH+tmux.
-- Captures each instance's `claude.ai/code/...` remote-control URL automatically (at creation, and again on every unattended refresh) and stores it — `claude-guardian url <name>` or `claude-guardian list` prints it without ever attaching. The point: create, discover, and reach a session entirely from another device, no terminal required.
+- Knows each instance's current `claude.ai/code/...` remote-control URL — `claude-guardian url <name>` or `claude-guardian list` prints it without ever attaching. The point: create, discover, and reach a session entirely from another device, no terminal required. Fetch it when you need it rather than bookmarking it: the URL changes whenever Remote Control reconnects.
 - If `claude` exits for any reason, it is respawned automatically within a few seconds, continuing the same conversation — the tmux session (and its scrollback) survives.
 - If the whole supervisor or the host reboots, every instance that was `activate`d comes back automatically.
-- While nobody is attached to an instance, periodically nudges it so it can't go silently stuck or unreachable: sends Enter to clear any confirmation `auto` permission mode fell back to after repeated classifier blocks, and proactively re-runs `/remote-control` well before Anthropic's ~30-minute "unreachable" threshold. See `DESIGN.md` → Known limitations for the safety tradeoff this involves.
+- While nobody is attached to an instance, periodically nudges it so it can't go silently stuck or unreachable: sends Enter to clear any confirmation `auto` permission mode fell back to after repeated classifier blocks, and checks that Remote Control is still connected — reconnecting it, and picking up the new URL, if it has dropped. The check reads Claude Code's own session file and types nothing into the session. See `DESIGN.md` → Known limitations for the tradeoffs this involves.
 - Lets you **pause** an instance (`deactivate`/`activate`: stop/resume supervision, tmux session left running) independently of **archiving** it (`archive`/`resume`: save scrollback + conversation id, then kill the process; pick the conversation back up later with `claude --resume`).
 - Runs preflight checks: auto-installs missing `apt` packages (`tmux`, `uuid-runtime` by default), verifies `claude` is on `PATH`. `install`/`new` refuse to proceed if `claude` isn't logged in yet (checked via `claude auth status`); once running, `run` only warns on login state so an instance that later loses auth keeps retrying instead of failing to start.
 - Ships an `attach` command for remote operators to take over a live session over SSH, as an alternative to the claude.ai remote-control URL.
@@ -75,7 +75,8 @@ Global defaults live in `/etc/claude-guardian/config.env`. Per-instance override
 | `CHECK_INTERVAL_SEC` | seconds between liveness checks | `5` | global |
 | `REQUIRED_APT_PKGS` | space-separated apt packages auto-installed if missing | `tmux uuid-runtime` | global |
 | `UNATTENDED_NUDGE_SEC` | unattended-only: send Enter after this many idle seconds to clear a stuck confirmation prompt (`0` disables) | `300` | global |
-| `REMOTE_CONTROL_REFRESH_SEC` | unattended-only: re-run `/remote-control` after this many idle seconds to refresh the connection and re-capture its URL (`0` disables) | `1200` | global |
+| `REMOTE_CONTROL_REFRESH_SEC` | unattended-only: seconds between checks that Remote Control is still connected, reconnecting it if not (`0` disables) | `1200` | global |
+| `CLAUDE_SESSIONS_DIR` | where Claude Code writes its per-session JSON files; read-only, and what the connected/disconnected check reads | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions` | global |
 | `MAX_SESSIONS` | `new`/`resume` refuse once this many instances already exist | `3` | global |
 
 Editing `CLAUDE_ARGS` to remove `--permission-mode auto` changes the safety tradeoff described in `DESIGN.md` → Known limitations — read that first.
@@ -88,7 +89,7 @@ Edit `/etc/claude-guardian/config.env` and `systemctl restart 'claude-guardian@*
 claude-guardian new <name> [--workdir D] [--args "..."] [--claude-bin PATH]
                             # create + enable + start a new instance
 claude-guardian list       # table of every instance
-claude-guardian url <name> # print the stored claude.ai remote-control URL
+claude-guardian url <name> # print the instance's current claude.ai remote-control URL
 claude-guardian activate <name>    # enable + start (survives reboot)
 claude-guardian deactivate <name>  # disable + stop supervision only — tmux session left running
 claude-guardian archive <name> [--yes]   # deactivate, save scrollback + conversation id, kill the session

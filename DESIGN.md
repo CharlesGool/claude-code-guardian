@@ -79,9 +79,10 @@ one systemd unit instance and one tmux session per `claude-guardian
    claude-guardian@<name>.service    |
    (one instance per name,           | every CHECK_INTERVAL_SEC:
     from a template unit)            | tmux has-session? / pane_dead? / client attached?
-                                      | (if unattended: nudge Enter / refresh
-                                      |  /remote-control + re-capture its URL —
-                                      |  on their own longer intervals, see below)
+                                      | (if unattended: nudge Enter / check that
+                                      |  Remote Control is still connected and
+                                      |  reconnect it if not — on their own
+                                      |  longer intervals, see below)
                                       v
                      tmux session "<name>" (remain-on-exit on)
                      — one of possibly several, all on the same
@@ -95,10 +96,11 @@ one systemd unit instance and one tmux session per `claude-guardian
                                     |                       |
                         operator: ssh + `claude-guardian     operator: claude.ai
                         attach <name>` (tmux attach)          web/phone (Remote Control) —
-                                                               URL scraped from the pane and
-                                                               stored, so `claude-guardian
-                                                               url <name>` prints it without
-                                                               ever attaching
+                                                               URL read from claude's own
+                                                               session file and stored, so
+                                                               `claude-guardian url <name>`
+                                                               prints it without ever
+                                                               attaching
 ```
 
 - **systemd layer** recovers from: reboot, one instance's supervisor
@@ -138,22 +140,40 @@ one systemd unit instance and one tmux session per `claude-guardian
   controllable"): when `tmux list-clients` shows nobody attached to an
   instance's session, its loop periodically (a) sends Enter — twice, one
   second apart — to clear any confirmation `--permission-mode auto` fell
-  back to after repeated classifier blocks, and (b) re-runs
-  `/remote-control` to both refresh the connection before Anthropic's
-  documented ~30-minute "could not reach the Remote Control server"
-  threshold can ever be hit, *and* re-scrape the (possibly changed)
-  `claude.ai/code/...` URL into instance state. Both stop immediately once
-  a client attaches (checked every tick). `create_session` sends the same
-  double Enter right after starting `claude`, for the same reason: a
-  genuinely first-ever run can show an onboarding/trust screen that needs
-  two Enters to clear, and that shouldn't have to wait for the first
-  unattended-nudge interval to pass — then does one synchronous
-  `/remote-control` capture of its own, so `new` can print the URL
-  immediately instead of waiting up to `REMOTE_CONTROL_REFRESH_SEC` for
-  the first periodic refresh. A second Enter once `claude` is already
+  back to after repeated classifier blocks, and (b) checks that Remote
+  Control is still connected, reconnecting it if it isn't. Both stop
+  immediately once a client attaches (checked every tick). `create_session`
+  sends the same double Enter right after starting `claude`, for the same
+  reason: a genuinely first-ever run can show an onboarding/trust screen
+  that needs two Enters to clear, and that shouldn't have to wait for the
+  first unattended-nudge interval to pass — then records the URL once
+  synchronously, so `new` can print it immediately instead of waiting up to
+  `REMOTE_CONTROL_REFRESH_SEC`. A second Enter once `claude` is already
   sitting at its normal prompt is a harmless no-op either way, so there's
   no downside to always sending two instead of trying to detect which
   screen is showing.
+- **how "still connected?" is answered** (see `DECISIONS.md`, 2026-08-17
+  "read claude's session file"): Claude Code writes one JSON file per
+  running session under `$CLAUDE_SESSIONS_DIR`
+  (`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions`), named after that
+  session's PID, whose `bridgeSessionId` field holds the Remote Control
+  session id while connected and is `null` once disconnected. An instance's
+  `claude` *is* its tmux pane command, so `#{pane_pid}` names the file
+  directly. Reading it answers both "is Remote Control still up?" and "what
+  is the current `claude.ai/code/...` URL?" without typing anything into
+  the session, which matters because the session may well have a human
+  working in it over Remote Control at that moment — Remote Control is not
+  a tmux client, so an actively-used instance still looks unattended here.
+  The file is matched textually (no `jq`/`python` dependency), and is
+  cross-checked against the instance's own `pid` and tracked
+  `claude_session_id` so a reused PID can't hand back a stranger's session.
+  Reconnecting is the only step that sends keys: `/remote-control` turns
+  Remote Control on when it is off, and when it is already on merely opens
+  an informational dialog ("Disconnect this session" / "Show QR code" /
+  "Continue"), which a trailing Escape closes without selecting anything.
+  **Re-running `/remote-control` on a session that still believes it is
+  connected refreshes nothing** — that mistaken assumption was the whole
+  basis of the v0.2.0 keepalive, and is why this checks before acting.
 - The two layers are deliberately independent per instance:
   `claude-guardian deactivate <name>` (`systemctl disable --now`) only
   stops that instance's *supervision loop*; it does not kill its live
@@ -231,7 +251,8 @@ Global variables live in `/etc/claude-guardian/config.env`, a plain `KEY="value"
 | `CHECK_INTERVAL_SEC` | seconds between liveness checks | `5` | global | no |
 | `REQUIRED_APT_PKGS` | space-separated apt packages auto-installed if missing | `tmux uuid-runtime` | global | no |
 | `UNATTENDED_NUDGE_SEC` | unattended-only: seconds of no attached tmux client before sending a bare Enter to clear a stuck confirmation prompt; `0` disables | `300` | global | no |
-| `REMOTE_CONTROL_REFRESH_SEC` | unattended-only: seconds of no attached tmux client before re-running `/remote-control` to refresh the connection and re-capture its URL; `0` disables | `1200` | global | no |
+| `REMOTE_CONTROL_REFRESH_SEC` | unattended-only: seconds between checks that Remote Control is still connected (reconnecting if not, and refreshing the stored URL either way); `0` disables | `1200` | global | no |
+| `CLAUDE_SESSIONS_DIR` | where Claude Code writes its per-session JSON files; read-only, and what makes the connected/disconnected check possible | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions` | global | no |
 | `MAX_SESSIONS` | `new`/`resume` refuse once this many instances already exist | `3` | global | no |
 
 ## Setup from scratch
@@ -246,7 +267,7 @@ Global variables live in `/etc/claude-guardian/config.env`, a plain `KEY="value"
 8. `claude-guardian deactivate second-instance` then check `pgrep -f 'claude --permission-mode'` — verify: both `claude` processes are still running (deactivate only pauses supervision, see Known limitations on `KillMode`). `claude-guardian activate second-instance` again — verify: the same `claude` PID for that instance is still there (supervision resumes against the existing session instead of recreating it).
 9. `claude-guardian archive second-instance --yes` — verify: `claude-guardian list` no longer shows `second-instance`; `claude-guardian archives` shows one entry for it with a saved `scrollback.txt`; `pgrep -f 'claude --permission-mode'` shows only the `claude-code` process remains.
 10. `claude-guardian resume second-instance` (or the exact archive id from step 9) — verify: `claude-guardian list` shows `second-instance` again, and `claude-guardian attach second-instance` continues the same conversation instead of starting fresh.
-11. Detach from `claude-code` and leave it unattended for longer than `UNATTENDED_NUDGE_SEC` — verify: `claude-guardian logs claude-code` shows a `sending Enter in case a prompt is stuck` line at that mark, and (after `REMOTE_CONTROL_REFRESH_SEC`) a `refreshing remote control connection` line, and neither fires again immediately after you reattach and detach once more (timers reset on attach).
+11. Detach from `claude-code` and leave it unattended for longer than `UNATTENDED_NUDGE_SEC` — verify: `claude-guardian logs claude-code` shows a `sending Enter in case a prompt is stuck` line at that mark, and that it does not fire again immediately after you reattach and detach once more (timers reset on attach). The Remote Control check at `REMOTE_CONTROL_REFRESH_SEC` is deliberately silent while the connection is healthy; to see it work, disconnect Remote Control from inside the session (`/remote-control` → `Disconnect this session`) and verify that within `REMOTE_CONTROL_REFRESH_SEC` the log shows `remote control disconnected ... reconnecting` followed by a *new* URL, and that `claude-guardian url claude-code` prints that new URL.
 12. `reboot` the host — verify: after boot, every instance that was `activate`d (not `deactivate`d) is `active` again without manual intervention.
 
 This project is not deployed with Docker; steps above are the full deployment procedure.
@@ -320,18 +341,35 @@ sufficient, without needing the rest of the repo.
   deliberately never deletes `/var/lib/claude-guardian/archive/` — remove
   individual archives explicitly with `rm-archive` if you want them gone
   too.
-- **Capturing the remote-control URL sends literal keystrokes
-  (`C-u`, `/remote-control`, `Enter`) into the tmux pane** — at instance
-  creation (right after the onboarding double-Enter) and on every
-  unattended refresh. If `claude` is, unexpectedly, still on a screen
-  other than its normal prompt at that exact moment (e.g. an onboarding
-  step beyond the two Enters already sent), those keystrokes can be typed
-  into the wrong place — harmless (nothing is auto-confirmed by this
-  specific step) but may leave stray text that needs clearing manually via
-  `claude-guardian attach <name>`. This is the same class of "blind
-  keystroke" tradeoff already accepted for the double-Enter onboarding
-  clear and the unattended nudge; see the `UNATTENDED_NUDGE_SEC` entry
-  above.
+- **Knowing whether Remote Control is still up depends on an internal
+  Claude Code file.** `$CLAUDE_SESSIONS_DIR/<pid>.json` and its
+  `bridgeSessionId` field are not a documented, promised interface; a
+  future Claude Code may rename, move, or stop writing them. Verified
+  against 2.1.202. When the file is absent or unreadable the tool degrades
+  rather than breaks: it falls back to sending `/remote-control` and
+  reading the URL off the screen, which is what v0.2.0 always did. Both the
+  path and the fallback are deliberate, and `CLAUDE_SESSIONS_DIR` is
+  overridable in the config so a moved file can be pointed at without
+  patching the script.
+- **Reconnecting Remote Control sends literal keystrokes (`C-u`,
+  `/remote-control`, `Escape`) into the tmux pane**, as does the initial
+  capture at instance creation (right after the onboarding double-Enter).
+  Unlike v0.2.0 this no longer happens on a timer — only when the check
+  above says Remote Control is actually disconnected — but if `claude` is,
+  unexpectedly, on a screen other than its normal prompt at that exact
+  moment (e.g. an onboarding step beyond the two Enters already sent),
+  those keystrokes can be typed into the wrong place. Harmless (nothing is
+  auto-confirmed by this step, and Escape dismisses rather than selects)
+  but it may leave stray text that needs clearing manually via
+  `claude-guardian attach <name>`. Same class of "blind keystroke" tradeoff
+  already accepted for the double-Enter onboarding clear and the unattended
+  nudge; see the `UNATTENDED_NUDGE_SEC` entry above.
+- **A reconnect changes the instance's `claude.ai/code/...` URL.** The
+  conversation is unaffected — it is the same `claude` process and the same
+  `claude_session_id` — but a previously-bookmarked link stops working.
+  There is no way to both genuinely reconnect and keep the old URL, so the
+  tool optimises for the connection being live and expects the URL to be
+  fetched on demand (`claude-guardian url <name>`) rather than saved.
 - **`resume` can only reconstruct a conversation if the archive has a
   recorded `claude_session_id`.** This is always true for archives created
   by this tool's own `archive` command (the id is captured at instance
@@ -355,9 +393,10 @@ sufficient, without needing the rest of the repo.
   the session was first created; for a session that predates v0.2.0, that
   original command has no `--session-id`, so no crash-respawn will ever
   retroactively add one. Practically: `list` shows `-` for that instance's
-  workdir and "not captured yet" for its URL until the periodic
-  unattended `/remote-control` refresh eventually captures the URL (state
-  isn't blocked, just late), and `archive` on that specific instance will
+  workdir, its URL is still found (that comes from claude's own session
+  file, which every running session has, and the missing tracked id only
+  skips half of the PID-reuse cross-check), and `archive` on that
+  instance will
   save an empty `claude_session_id` — `resume` will then correctly refuse
   and point at the raw scrollback instead of guessing. The only way to
   give a migrated instance a real, resumable session id is to let its
@@ -393,14 +432,15 @@ sufficient, without needing the rest of the repo.
   refusing to start. This is deliberate, not an oversight: a service that
   was working and later loses auth (expired token, revoked session) should
   keep trying to serve, not go into a restart-fail loop.
-- **`REMOTE_CONTROL_REFRESH_SEC`'s 1200s default is a proactive guess based
-  on documented behavior, not an exact reproduction.** Anthropic's docs
-  state a Remote Control session that "could not reach the Remote Control
-  server for about 30 minutes" needs a manual `/remote-control` to
-  reconnect; whether an idle-but-network-healthy session can go stale on
-  its own timeline was explicitly flagged as undocumented during research
-  for this feature. Refreshing at 20 minutes is comfortably inside the
-  documented 30-minute failure window either way.
+- **`REMOTE_CONTROL_REFRESH_SEC`'s 1200s default bounds how long a dropped
+  connection can go unnoticed, and nothing more.** v0.2.0 chose 20 minutes
+  to stay inside Anthropic's documented ~30-minute "could not reach the
+  Remote Control server" window, on the assumption that re-running
+  `/remote-control` beforehand would keep the connection from ever
+  expiring. That assumption was wrong (see `DECISIONS.md`, 2026-08-17), so
+  the number now means something much simpler: a disconnect is detected and
+  repaired within at most this many seconds. Lowering it shortens the
+  outage; the check is a single file read, so it is cheap to lower.
 - **The unattended-nudge/refresh timers only start counting from when the
   supervision loop itself (re)starts, not from whenever the session was
   actually last attended.** This was a real bug caught live: the first

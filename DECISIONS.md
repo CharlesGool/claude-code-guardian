@@ -8,6 +8,72 @@ already-rejected option gets recommended again two weeks later.
 
 ---
 
+## 2026-08-17 — read Remote Control state from claude's own session file instead of scraping the terminal
+
+- **Context:** the operator reported two symptoms in production: sessions
+  showing "disconnected" on claude.ai after being left alone for a while,
+  and an extra conversation appearing after every boot. Investigating both
+  turned up four distinct problems, three of them in this tool.
+- **What was actually wrong:**
+  1. **The v0.2.0 keepalive did nothing.** It re-ran `/remote-control`
+     every `REMOTE_CONTROL_REFRESH_SEC` on the belief that this refreshes
+     the connection. Verified against the real binary: when Remote Control
+     is *already* on, `/remote-control` only opens an informational dialog
+     ("Disconnect this session" / "Show QR code" / "Continue"). It
+     re-establishes nothing. So when the connection genuinely dropped,
+     nothing repaired it — which is exactly the reported symptom.
+  2. **The URL scrape could capture a stranger's URL.** It grepped the
+     whole visible pane for `https://claude.ai/code/session_...` and took
+     the last match. Caught live: instance `claude-code` had another
+     instance's URL printed on screen (the operator had been debugging
+     there), and the refresh wrote *that* into `claude-code`'s state, so
+     `claude-guardian url claude-code` handed back a link to a different
+     conversation. Any session URL that happens to be visible — a commit
+     trailer, some command's output — could do this.
+  3. **"Unattended" was measured wrong for this purpose.** Remote Control
+     is not a tmux client, so an instance a human is actively driving from
+     claude.ai looks unattended, and the periodic `/remote-control`
+     injection landed *in that live conversation* as a user turn.
+  4. Not a tool bug: a leftover `test` instance from v0.2.0 verification
+     was still enabled, so boot started two instances. Archived.
+- **Decision:** stop inferring Remote Control state from the terminal.
+  Claude Code writes `$CLAUDE_SESSIONS_DIR/<pid>.json` per running
+  session, whose `bridgeSessionId` field holds the Remote Control session
+  id while connected and is `null` once disconnected; an instance's
+  `claude` is its tmux pane command, so `#{pane_pid}` names that file
+  directly. Read it to answer both "still connected?" and "what is the
+  URL?". `REMOTE_CONTROL_REFRESH_SEC` changes meaning accordingly: it is
+  now how often that check runs, and keys are sent *only* when the check
+  says the connection is actually down. On a healthy instance the
+  supervisor now types nothing at all.
+- **Rejected — keep scraping, but anchor the regex to the
+  `/remote-control` output.** This fixes the wrong-URL bug (and is in fact
+  retained as the fallback for a Claude Code that writes no session file),
+  but it cannot fix the real one: it still requires typing into the session
+  to learn anything, so it cannot distinguish "connected" from
+  "disconnected" without disturbing a conversation that may have a human in
+  it.
+- **Rejected — detect the connection via the `/rc` indicator in the status
+  line.** That indicator comes from the operator's `claude-hud` statusline
+  plugin, not from Claude Code, so it would work on exactly one machine.
+- **Rejected — reconnect unconditionally on every check.** Simple and
+  always-fresh, but every reconnect mints a new `claude.ai/code/...` URL
+  (verified live: the id changed across one disconnect/connect cycle on an
+  otherwise untouched session), so this would churn the URL every 20
+  minutes for no benefit.
+  Reconnect only when actually disconnected.
+- **Accepted cost:** `bridgeSessionId` is an internal Claude Code detail,
+  not a promised interface, verified against 2.1.202. Mitigated three ways:
+  the path is configurable (`CLAUDE_SESSIONS_DIR`), the read is
+  cross-checked against the instance's own `pid` and tracked
+  `claude_session_id` so a reused PID can't return a stranger's session,
+  and an unreadable file degrades to the v0.2.0 scrape rather than failing.
+- **Consequence for operators:** a reconnect changes the instance's URL, so
+  the URL is something to fetch on demand (`claude-guardian url <name>`),
+  not to bookmark. Documented in README and DESIGN.
+
+---
+
 ## 2026-08-17 — reverses "single default session" (2026-08-16): add named, concurrent multi-instance support
 
 - **Context:** the operator's real workflow evolved into wanting several
