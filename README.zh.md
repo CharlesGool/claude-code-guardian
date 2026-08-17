@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-> 译自 `README.md`（v0.4.0）。如有冲突，以英文版为准。
+> 译自 `README.md`（v0.5.0）。如有冲突，以英文版为准。
 
 在 Debian 服务器上，以 root 身份常驻一个或多个命名的、可远程接管的 Claude Code（`claude`）会话，无论机器重启还是 `claude` 进程本身被杀（Ctrl+C、崩溃、`exit`）都能保证实例还在。
 
@@ -43,6 +43,16 @@ bash bin/claude-guardian.sh install
 ```
 
 `install` 会执行前置检查，把默认的全局配置写到 `/etc/claude-guardian/config.env`，把脚本安装到 `/usr/local/bin/claude-guardian`，写入 systemd **实例模板**（`claude-guardian@.service`），并创建、启用一个名为 `claude-code` 的默认实例。它不会启动这个实例——那是下一步。从 v0.1.0 升级时，会自动把原来的单一会话迁移到新模板上，且不会杀掉正在运行的 `claude` 进程。
+
+### 可选：`claude-session` skill
+
+`skills/claude-session/` 是一个 Agent Skill，让 Claude Code 能直接听懂自然语言来调用这些命令（"开一个常驻对话"、"列一下我的对话"、"归档这个"），不用你去记 CLI。它同时把破坏性命令的规则写了进去——`archive` 和 `purge` 会杀掉正在运行的 `claude` 进程，所以这个 skill 要求用户明确点名该动作后才会执行。
+
+```bash
+cp -r skills/claude-session ~/.claude/skills/
+```
+
+装不装都行，它不改变工具本身：没有它，`claude-guardian` 的行为完全一样。
 
 ## 快速开始
 

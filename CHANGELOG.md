@@ -4,6 +4,16 @@ Newest version first. Only changes a user can perceive — internal refactors do
 not need an entry. Draft from `git log <previous-tag>..HEAD --oneline`, then
 rewrite in user-facing terms.
 
+## v0.5.0 — 2026-08-17
+
+The `claude-session` Agent Skill now ships with the tool.
+
+### Added
+- `skills/claude-session/`, installed with `cp -r skills/claude-session ~/.claude/skills/`. With it, Claude Code drives these commands from plain language — "开一个常驻对话", "list my sessions", "give me the link for that one", "archive this" — instead of you recalling the CLI. It also carries the destructive-command rules: `archive` and `purge` kill live `claude` processes, so the skill runs neither without you naming that action, shows which instance it is about to archive first, and refuses to read "pause" / "取消激活" as a request to end a conversation. Entirely optional.
+
+### Changed
+- Nothing in `bin/claude-guardian.sh` — the supervisor is byte-identical to v0.4.0. This release is the skill plus the install notes for it in both READMEs.
+
 ## v0.4.0 — 2026-08-17
 
 A rebooted instance now comes back on the conversation it was having, and
