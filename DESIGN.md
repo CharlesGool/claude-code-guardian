@@ -222,6 +222,7 @@ Rejected alternatives and the reasoning behind each choice live in
 |---|---|---|
 | `claude` (Claude Code CLI) | installed and authenticated by the operator beforehand — this tool does not install it | anywhere on `root`'s `PATH`, or point `CLAUDE_BIN` at an absolute path |
 | `uuidgen` (`uuid-runtime` package) | auto-installed by preflight if missing, like `tmux` | used once per instance creation/resume to mint or reuse a `claude --session-id`/`--resume` value |
+| Claude Code's per-session files (`$CLAUDE_SESSIONS_DIR/<pid>.json`, field `bridgeSessionId`) | written by `claude` itself while a session runs — nothing to install | read to tell whether an instance's Remote Control is still connected, and to get its current `claude.ai/code/...` URL. Verified against Claude Code **2.1.202**; this is an internal detail, not a promised interface, so a different version may not provide it — the tool then falls back to reading the URL off the terminal (see Known limitations) |
 
 ### Paths & mounts
 
@@ -237,6 +238,7 @@ Every path below is configurable only via the constants near the top of `bin/cla
 | `/usr/local/bin/claude-guardian` | this tool, on `install` (copied from `bin/claude-guardian.sh`) | the installed CLI entry point |
 | `$TMUX_SOCKET` (default `/run/claude-guardian/tmux.sock`) | this tool, created at runtime | one dedicated tmux server socket shared by every instance, isolated from any interactive admin's own tmux server on `/tmp` |
 | `$WORKDIR` (default `/root`, overridable per instance) | operator, via config or `new --workdir` | working directory `claude` starts in |
+| `$CLAUDE_SESSIONS_DIR` (default `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions`) | Claude Code, not this tool | read-only: one JSON file per running `claude` session, named after its PID; source of the Remote Control connected/disconnected check |
 
 ### Configuration reference
 

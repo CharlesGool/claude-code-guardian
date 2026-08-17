@@ -4,7 +4,7 @@ Newest version first. Only changes a user can perceive — internal refactors do
 not need an entry. Draft from `git log <previous-tag>..HEAD --oneline`, then
 rewrite in user-facing terms.
 
-## v0.3.0 — unreleased
+## v0.3.0 — 2026-08-17
 
 Remote Control now actually gets repaired when it drops, and the URL an
 instance reports is guaranteed to be its own. See DECISIONS.md, 2026-08-17

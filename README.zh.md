@@ -2,17 +2,17 @@
 
 [English](README.md) | **简体中文**
 
-> 译自 `README.md`（v0.2.0）。如有冲突，以英文版为准。
+> 译自 `README.md`（v0.3.0）。如有冲突，以英文版为准。
 
 在 Debian 服务器上，以 root 身份常驻一个或多个命名的、可远程接管的 Claude Code（`claude`）会话，无论机器重启还是 `claude` 进程本身被杀（Ctrl+C、崩溃、`exit`）都能保证实例还在。
 
 ## 功能
 
 - 安装一个 systemd **实例模板**，为每个命名实例监督一个专用的 `tmux` 会话，默认在其中运行 `claude --permission-mode auto --remote-control`——远程控制指的是可以直接在 **claude.ai 网页或手机上**接管任意一个实例，不只是走 SSH+tmux。
-- 自动捕获每个实例的 `claude.ai/code/...` 远程控制链接（创建时捕获一次，之后每次无人值守的刷新周期再捕获一次）并保存下来——`claude-guardian url <name>` 或 `claude-guardian list` 无需接管会话即可打印出来。这样做的意义在于：完全可以从另一台设备创建、发现、接入一个会话，不需要终端。
+- 掌握每个实例当前的 `claude.ai/code/...` 远程控制链接——`claude-guardian url <name>` 或 `claude-guardian list` 无需接管会话即可打印出来。这样做的意义在于：完全可以从另一台设备创建、发现、接入一个会话，不需要终端。用的时候现取，不要收藏成书签：远程控制每次重连，链接都会变。
 - `claude` 无论因何退出，都会在几秒内自动重新拉起，接着同一段对话继续——tmux 会话（连同其滚动记录）不受影响。
 - 整个监督进程或宿主机重启后，每一个曾经被 `activate` 过的实例都会自动回来。
-- 只要某个实例暂时无人接管，就会定期"敲一下"它，防止它悄悄卡死或变得不可达：发送 Enter 清除 `auto` 权限模式在多次被分类器拦截后可能回退出现的确认弹窗，并在 Anthropic 文档所述的约 30 分钟"不可达"阈值到来之前主动重新执行 `/remote-control`。这里涉及的安全权衡见 `DESIGN.md` → Known limitations。
+- 只要某个实例暂时无人接管，就会定期"敲一下"它，防止它悄悄卡死或变得不可达：发送 Enter 清除 `auto` 权限模式在多次被分类器拦截后可能回退出现的确认弹窗，并检查远程控制是否还连着——断了就重连，并取回新的链接。这项检查读的是 Claude Code 自己的会话文件，不会往会话里输入任何东西。这里涉及的权衡见 `DESIGN.md` → Known limitations。
 - 可以**暂停**一个实例（`deactivate`/`activate`：只停/恢复监督，tmux 会话继续跑），这与**归档**它（`archive`/`resume`：先保存滚动记录和对话 id，再杀掉进程；之后用 `claude --resume` 接回对话）是两件独立的事。
 - 前置检查：自动安装缺失的 `apt` 包（默认是 `tmux`、`uuid-runtime`），确认 `claude` 在 `PATH` 上。`install`/`new` 阶段如果 `claude` 还没登录（通过 `claude auth status` 检测）会直接拒绝继续；实例一旦跑起来，`run` 阶段对登录状态只警告不阻塞，这样实例后续如果丢失登录状态也会继续重试，而不是直接启动失败。
 - 提供 `attach` 命令，供远程操作者通过 SSH 接管某个存活的会话，作为 claude.ai 远程控制链接之外的另一条路径。
@@ -33,7 +33,7 @@
 ```bash
 # 克隆一个 tag，不要克隆分支尖端——分支尖端可能处于改动中途。
 # 查看可用 tag：git ls-remote --tags <repo-url>
-git clone --depth 1 --branch v0.2.0 https://github.com/CharlesGool/claude-code-guardian.git
+git clone --depth 1 --branch v0.3.0 https://github.com/CharlesGool/claude-code-guardian.git
 cd claude-code-guardian
 bash bin/claude-guardian.sh install
 ```
@@ -77,7 +77,8 @@ claude-guardian url work      # 只打印 claude.ai 链接——不需要接管
 | `CHECK_INTERVAL_SEC` | 存活检查的间隔秒数 | `5` | 全局 |
 | `REQUIRED_APT_PKGS` | 缺失时自动安装的 apt 包，空格分隔 | `tmux uuid-runtime` | 全局 |
 | `UNATTENDED_NUDGE_SEC` | 仅无人值守时生效：空闲这么多秒后发送 Enter 清除卡住的确认弹窗（`0` 表示禁用） | `300` | 全局 |
-| `REMOTE_CONTROL_REFRESH_SEC` | 仅无人值守时生效：空闲这么多秒后重新执行 `/remote-control` 刷新连接并重新捕获链接（`0` 表示禁用） | `1200` | 全局 |
+| `REMOTE_CONTROL_REFRESH_SEC` | 仅无人值守时生效：每隔这么多秒检查一次远程控制是否还连着，断了就重连（`0` 表示禁用） | `1200` | 全局 |
+| `CLAUDE_SESSIONS_DIR` | Claude Code 写每个会话 JSON 文件的位置；只读，连接/断开检查读的就是这里 | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions` | 全局 |
 | `MAX_SESSIONS` | 实例数达到这个值后 `new`/`resume` 会拒绝 | `3` | 全局 |
 
 把 `CLAUDE_ARGS` 里的 `--permission-mode auto` 去掉会改变 `DESIGN.md` → Known limitations 里描述的那个安全权衡——动手前先读那一节。
@@ -90,7 +91,7 @@ claude-guardian url work      # 只打印 claude.ai 链接——不需要接管
 claude-guardian new <name> [--workdir D] [--args "..."] [--claude-bin PATH]
                             # 创建 + 启用 + 启动一个新实例
 claude-guardian list       # 列出所有实例的表格
-claude-guardian url <name> # 打印保存下来的 claude.ai 远程控制链接
+claude-guardian url <name> # 打印该实例当前的 claude.ai 远程控制链接
 claude-guardian activate <name>    # 启用 + 启动（重启后仍会自动拉起）
 claude-guardian deactivate <name>  # 禁用 + 只停止监督——tmux 会话继续留着
 claude-guardian archive <name> [--yes]   # 先取消激活，保存滚动记录 + 对话 id，再杀掉会话
