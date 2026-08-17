@@ -616,6 +616,17 @@ capture_remote_control_url() {
 #       writes none, or one that cannot be trusted to be this instance's).
 #       Retrying every minute here would type /remote-control into the
 #       session forever, since nothing will ever confirm success.
+# Seed value for the reconnect timer: far enough in the past that the first
+# disconnect found after a (re)start is repaired immediately, while every
+# retry after it still waits out the backoff. Caught live in v0.6.0 testing:
+# seeding it with "now" like the other timers meant a session that dropped
+# 20 seconds after its supervisor started sat unreachable for the remaining
+# 40 seconds of a backoff window that was protecting nothing — no reconnect
+# had been attempted yet.
+reconnect_ready_at() {
+  echo "$(( $(date +%s) - REMOTE_CONTROL_RECONNECT_BACKOFF_SEC ))"
+}
+
 connection_state() {
   local name="$1" url
   if url=$(bridge_url_of "$name"); then
@@ -636,8 +647,9 @@ supervise_loop() {
 
   # Start the countdown from loop-start, not epoch 0 — otherwise a session
   # that's already alive and unattended when the loop (re)starts (e.g. a
-  # systemd restart, or a reboot) triggers an immediate nudge/refresh
-  # instead of waiting out the configured interval first.
+  # systemd restart, or a reboot) triggers an immediate nudge instead of
+  # waiting out the configured interval first. The reconnect timer is the
+  # deliberate exception — see reconnect_ready_at.
   local last_nudge last_check last_reconnect
   last_nudge=$(date +%s)
   last_check=$(date +%s)
@@ -652,7 +664,7 @@ supervise_loop() {
       create_session "$name"
       last_nudge=$(date +%s)
       last_check=$(date +%s)
-      last_reconnect=$(date +%s)
+      last_reconnect=$(reconnect_ready_at)
     elif pane_is_dead "$name"; then
       respawn_pane "$name"
     elif has_attached_client "$name"; then
@@ -661,7 +673,7 @@ supervise_loop() {
       # they leave
       last_nudge=$(date +%s)
       last_check=$(date +%s)
-      last_reconnect=$(date +%s)
+      last_reconnect=$(reconnect_ready_at)
     else
       local now
       now=$(date +%s)

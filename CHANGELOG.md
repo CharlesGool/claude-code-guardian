@@ -4,6 +4,11 @@ Newest version first. Only changes a user can perceive — internal refactors do
 not need an entry. Draft from `git log <previous-tag>..HEAD --oneline`, then
 rewrite in user-facing terms.
 
+## v0.6.1 — 2026-08-17
+
+### Fixed
+- **The first dropped connection after a restart is repaired immediately, not up to a minute later.** The reconnect backoff timer was seeded as if a reconnect had just been attempted, so an instance that dropped shortly after its supervisor started (or after a reboot, when every instance starts at once) waited out a backoff window that was protecting nothing. Found by live-testing v0.6.0: a deliberate disconnect 40s after instance creation took 25s to repair instead of 5s. Retries after the first attempt are unaffected.
+
 ## v0.6.0 — 2026-08-17
 
 An instance stays reachable now: a dropped Remote Control connection is
