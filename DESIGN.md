@@ -345,7 +345,26 @@ sufficient, without needing the rest of the repo.
   This relies on `KillMode=process` in both the old and new unit to be
   true (verified above) — if a future systemd unit change ever drops that
   setting, this migration path would need re-verification against a live
-  session before being trusted again.
+  session before being trusted again. Verified against a real production
+  host: the tmux pane's PID and liveness were unchanged immediately before
+  and after `install`.
+- **A migrated pre-existing session never gets a tracked
+  `claude_session_id`, `workdir`, or captured URL until it is genuinely
+  recreated** — discovered on the same live migration above.
+  `respawn-pane` only ever replays the *original* command tmux stored when
+  the session was first created; for a session that predates v0.2.0, that
+  original command has no `--session-id`, so no crash-respawn will ever
+  retroactively add one. Practically: `list` shows `-` for that instance's
+  workdir and "not captured yet" for its URL until the periodic
+  unattended `/remote-control` refresh eventually captures the URL (state
+  isn't blocked, just late), and `archive` on that specific instance will
+  save an empty `claude_session_id` — `resume` will then correctly refuse
+  and point at the raw scrollback instead of guessing. The only way to
+  give a migrated instance a real, resumable session id is to let its
+  tmux session actually end and be recreated (e.g. `archive` it once,
+  deliberately, then `resume`/`new` it back) — there is no in-place
+  backfill, and hand-editing its state file would just fabricate an id
+  `claude` never actually used.
 - **Detach with the tmux prefix, not Ctrl+C — and a single Ctrl+C does not
   kill `claude` anyway.** Verified against the real CLI: Claude Code treats
   one Ctrl+C as "interrupt the current turn" (like most REPLs), not exit —
