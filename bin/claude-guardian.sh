@@ -653,7 +653,7 @@ supervise_loop() {
   local last_nudge last_check last_reconnect
   last_nudge=$(date +%s)
   last_check=$(date +%s)
-  last_reconnect=$(date +%s)
+  last_reconnect=$(reconnect_ready_at)
 
   if [ -n "${REMOTE_CONTROL_REFRESH_SEC:-}" ]; then
     log "warning: REMOTE_CONTROL_REFRESH_SEC is set but was replaced in v0.6.0 by REMOTE_CONTROL_CHECK_SEC (how often to check, default 5s) and REMOTE_CONTROL_RECONNECT_BACKOFF_SEC (how often a reconnect may be retried, default 60s) — the old setting is ignored; remove it from $CONFIG_FILE"

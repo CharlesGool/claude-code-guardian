@@ -4,6 +4,11 @@ Newest version first. Only changes a user can perceive — internal refactors do
 not need an entry. Draft from `git log <previous-tag>..HEAD --oneline`, then
 rewrite in user-facing terms.
 
+## v0.6.2 — 2026-08-17
+
+### Fixed
+- **v0.6.1's fix only covered two of the three places the reconnect timer is seeded.** The one that matters most in practice — loop start, i.e. every `systemctl restart` and every boot — was still seeded as "just reconnected", so the first drop after a restart waited out the full backoff. Verified live this time: a deliberate disconnect was repaired in seconds, and the isolated test suite gained a case that fails against v0.6.1.
+
 ## v0.6.1 — 2026-08-17
 
 ### Fixed
