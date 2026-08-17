@@ -4,6 +4,43 @@ Newest version first. Only changes a user can perceive — internal refactors do
 not need an entry. Draft from `git log <previous-tag>..HEAD --oneline`, then
 rewrite in user-facing terms.
 
+## v0.4.0 — 2026-08-17
+
+A rebooted instance now comes back on the conversation it was having, and
+the unattended Enter is no longer sent to sessions that don't need it. Both
+were reported from production use and were listed as known issues in v0.3.0.
+See DECISIONS.md, 2026-08-17 ("resume the conversation across a reboot" and
+"nudge only a session that is actually parked").
+
+### Fixed
+- **A reboot no longer throws away the conversation.** Every boot started
+  each instance on a brand-new conversation while the previous one sat on
+  disk, reachable only by hand with `claude --resume`. An instance now comes
+  back on the conversation it already had, whenever that conversation's
+  transcript still exists. Set `RESUME_AFTER_RESTART=0` for the old
+  behaviour. A conversation that can no longer be resumed falls back to a
+  new one instead of leaving the instance stuck respawning.
+- **The unattended Enter no longer lands in sessions somebody is using.** It
+  fired on elapsed time alone, and Remote Control is not a tmux client, so
+  a session being driven from claude.ai looked abandoned and could have a
+  confirmation dialog answered on the operator's behalf. The supervisor now
+  asks `claude` what the session is actually doing and types only into one
+  that has been parked on a dialog, unanswered, for the full
+  `UNATTENDED_NUDGE_SEC`.
+
+### Changed
+- `MAX_SESSIONS` now defaults to `0`, meaning no limit; set it to a positive
+  number to reinstate a ceiling. It previously defaulted to `3`, which read
+  as a hard limit of the tool rather than the cost guardrail it is. Existing
+  installs keep whatever value is already in
+  `/etc/claude-guardian/config.env`.
+- `UNATTENDED_NUDGE_SEC` now means "how long a confirmation dialog may sit
+  unanswered before it is cleared" rather than "how long the session may go
+  untouched". Same default (`300`).
+- New config keys `RESUME_AFTER_RESTART` and `CLAUDE_PROJECTS_DIR`. Both
+  have working defaults, so an existing `config.env` needs no edit;
+  `install` leaves an existing config untouched as before.
+
 ## v0.3.0 — 2026-08-17
 
 Remote Control now actually gets repaired when it drops, and the URL an

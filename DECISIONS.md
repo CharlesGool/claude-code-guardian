@@ -8,6 +8,118 @@ already-rejected option gets recommended again two weeks later.
 
 ---
 
+## 2026-08-17 — resume the conversation across a reboot instead of starting an empty one
+
+- **Context:** the operator's report, after v0.3.0 had been running a while:
+  "重启后恢复的也没有记录啊，所以没什么意义" — the instances did come back
+  after a reboot, but each on a blank conversation, so what survived was the
+  *process*, not the *work*. This had been recorded as a v0.3.0 known issue;
+  production use made it the more important of the two.
+- **What was actually happening:** `respawn-pane` reuses the pane's original
+  command line, so a `claude` that crashes comes back on the same
+  `--session-id` — that path was always fine. A reboot is different: it
+  takes the tmux server with it, so `create_session` runs, and it minted a
+  fresh `uuidgen` id unconditionally. Confirmed on the operator's host: the
+  pre-reboot transcript was intact on disk (4.6 MB, last written seven
+  minutes before the reboot) and simply orphaned.
+- **Decision:** `create_session` now prefers the instance's own last
+  `claude_session_id` — already recorded in state for `archive`/`resume` —
+  and starts `claude --resume <id>`, gated on that conversation's transcript
+  still existing under `$CLAUDE_PROJECTS_DIR`. Order of preference: explicit
+  `RESUME_SESSION_ID` (from `resume <archive-id>`), then the instance's own
+  previous conversation, then a new id. `RESUME_AFTER_RESTART=0` restores
+  the old behaviour.
+- **Rejected — resume unconditionally, without checking the transcript.**
+  One less internal-layout dependency, but it hands `claude` an id it may
+  never have heard of, and the failure is silent-then-fatal: `claude` exits
+  immediately, the supervisor rebuilds the same failing command every
+  `CHECK_INTERVAL_SEC`, and the instance never comes back. Checking first
+  costs one `[ -r ]`.
+- **Rejected — `claude --continue` (resume the most recent conversation in
+  this working directory).** No transcript path dependency at all, but "most
+  recent in this cwd" is not "this instance's own": two instances sharing a
+  `WORKDIR`, or any conversation the operator ran there by hand, would be
+  picked up by the wrong instance. Instance identity has to come from this
+  tool's own state.
+- **Rejected — `--fork-session` on resume.** Would keep each boot's history
+  separate and readable, at the cost of the thing being asked for: one
+  continuous conversation across reboots.
+- **Accepted cost:** the transcript path (`$CLAUDE_PROJECTS_DIR/<workdir
+  with every non-alphanumeric replaced by `-`>/<id>.jsonl`) is an internal
+  Claude Code layout, verified against 2.1.202, in the same class as
+  `bridgeSessionId`. Mitigated the same way: the path is configurable, and a
+  miss degrades to starting a new conversation rather than failing. The
+  failure mode to watch for is silent — if the convention changes, every
+  reboot quietly starts fresh again.
+- **Also accepted:** a `--resume` that `claude` rejects for some other
+  reason. `create_session` checks once, a few seconds after starting,
+  whether the session died — or never materialised, since `remain-on-exit`
+  is only set after `new-session` returns, so a fast exit takes the whole
+  session with it — and retries with a new conversation. That second half
+  was found by the isolated tests, and it is exactly the loop-forever bug
+  the check exists to prevent.
+- **Consequence for operators:** observed live and worth knowing — because
+  the `claude` session id is unchanged, the instance's `claude.ai/code/...`
+  URL also survived the reboot in testing. That is a side effect of how
+  Remote Control binds to the session, not a promise; keep fetching the URL
+  with `claude-guardian url <name>`.
+
+---
+
+## 2026-08-17 — nudge only a session that is actually parked on a dialog, not one that merely looks unattended
+
+- **Context:** the second v0.3.0 known issue. `UNATTENDED_NUDGE_SEC` sent a
+  double Enter to any instance with no tmux client, every 300s. Remote
+  Control is not a tmux client, so a session the operator was driving from
+  claude.ai qualified — harmless at an idle prompt, but capable of answering
+  a confirmation dialog on their behalf.
+- **Decision:** gate the nudge on Claude Code's own `status` field in
+  `$CLAUDE_SESSIONS_DIR/<pid>.json`. Three values, all observed live on
+  2.1.202: `busy` (mid-turn), `idle` (empty prompt), `waiting` (parked on a
+  confirmation dialog). Only `waiting` is typed into, and only once
+  `statusUpdatedAt` shows the dialog has gone unanswered for
+  `UNATTENDED_NUDGE_SEC` — so the countdown starts when the dialog appeared,
+  not when the supervisor happened to look. This also makes the nudge
+  strictly more useful: it fires on the one state it was written for,
+  instead of on a timer that mostly hit sessions with nothing to clear.
+- **Rejected — gate on `updatedAt` (last activity) instead.** Tried first,
+  and it looked right until it was measured against a real session: the
+  maintainer's own instance had been mid-turn for twenty minutes and still
+  carried a twenty-minute-old `updatedAt`, because the field tracks status
+  *transitions*, not ongoing work. Gating on it would have sent Enter into
+  exactly the session the change exists to protect.
+- **Rejected — skip the nudge whenever Remote Control is connected.**
+  Trivial with what v0.3.0 already reads, but every instance runs
+  `--remote-control` by default, so it would disable the nudge everywhere
+  rather than narrow it.
+- **Accepted cost:** a human on claude.ai who opens a dialog and leaves it
+  for longer than `UNATTENDED_NUDGE_SEC` while still meaning to answer it is
+  indistinguishable from an abandoned session, and will still have it
+  answered for them. Raising the interval is the knob. When no usable
+  session file exists, the v0.2.0 wall-clock behaviour remains as the
+  fallback.
+
+---
+
+## 2026-08-17 — MAX_SESSIONS defaults to 0 (no limit)
+
+- **Context:** the operator hit `MAX_SESSIONS=3` and read it as a limit of
+  the tool — "对话为什么有3个限制，我实测可以开很多啊?" — which is the wrong
+  mental model: the limit only ever applied to guardian-supervised
+  instances, never to Claude Code itself.
+- **Decision:** default `MAX_SESSIONS="0"`, meaning no limit, with the
+  ceiling still available to anyone who wants one. `0` had to be given that
+  meaning explicitly; before this it would have refused every instance,
+  since the check was a bare `count >= MAX_SESSIONS`.
+- **Rejected — remove the setting entirely.** The cost concern behind it is
+  real (each instance is a separate `claude` process and token budget); what
+  was wrong was imposing a number on everyone by default.
+- **Consequence:** existing installs keep whatever is already in their
+  `config.env` — `install` deliberately never overwrites it — so this only
+  changes what a fresh install gets.
+
+---
+
 ## 2026-08-17 — read Remote Control state from claude's own session file instead of scraping the terminal
 
 - **Context:** the operator reported two symptoms in production: sessions

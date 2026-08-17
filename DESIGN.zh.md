@@ -2,7 +2,7 @@
 
 [English](DESIGN.md) | **简体中文**
 
-> 译自 `DESIGN.md`（v0.3.0）。如有冲突，以英文版为准。
+> 译自 `DESIGN.md`（v0.4.0）。如有冲突，以英文版为准。
 
 > 本文档的成败标准：另一个人，在另一台机器上，能照着它把这个项目重建出来。写的时候假设读者看不到你的机器。
 
@@ -16,7 +16,7 @@
 - 扛得住 `claude` 进程本身被杀——Ctrl+C、崩溃、`exit`、OOM kill——在几秒内自动重启它，且不丢失周围的会话。
 - 在长时间无人值守的情况下依然保持真正可达，而不只是"进程还在跑"：定期清除 `auto` 权限模式可能回退出现的确认弹窗，并在 Remote Control 连接失效之前主动刷新它（这里涉及的安全权衡见 Known limitations）。
 - 跑前置检查：确认所需的 `apt` 包已就位（缺失则自动安装）、`claude` 二进制已就位（硬性要求，永远不会自动安装）。登录状态通过 `claude auth status` 检测（这是权威判断，不是靠猜文件是否存在）——`install`/`new` 如果未登录会拒绝继续（一个从未登录过的实例只会白白重启一个没人能用的会话），而 `run` 只会警告，这样一个后来丢失登录状态的实例会继续重试，而不是直接拒绝启动。
-- 限制资源/成本增长：并发实例数达到 `MAX_SESSIONS`（默认 3）后，`new` 会拒绝——每个实例都是一个独立的 `claude` 进程，也是一份独立的 token 花费。
+- 对资源/成本增长提供一道护栏，但不强加：并发实例数达到 `MAX_SESSIONS` 后，`new` 会拒绝——每个实例都是一个独立的 `claude` 进程，也是一份独立的 token 花费。默认值是 `0`（不限制），因为一个操作者想同时开多少段对话是工作流层面的决定，不是这个工具能猜出来的；这个旋钮是留给确实想设上限的人的。
 - 用一套小巧、好记的 CLI 来操作（`claude-guardian <动词> [<name>]`）。
 
 **非目标**
@@ -37,10 +37,11 @@
    claude-guardian@<name>.service    |
    (one instance per name,           | every CHECK_INTERVAL_SEC:
     from a template unit)            | tmux has-session? / pane_dead? / client attached?
-                                      | (if unattended: nudge Enter / check that
-                                      |  Remote Control is still connected and
-                                      |  reconnect it if not — on their own
-                                      |  longer intervals, see below)
+                                      | (if unattended: clear a dialog nobody
+                                      |  answered / check that Remote Control
+                                      |  is still connected and reconnect it
+                                      |  if not — on their own longer
+                                      |  intervals, see below)
                                       v
                      tmux session "<name>" (remain-on-exit on)
                      — one of possibly several, all on the same
@@ -48,8 +49,9 @@
                                     |
                                     v
         claude --permission-mode auto --remote-control --session-id <uuid>
-        (or --resume <uuid> instead of --session-id, if this instance
-         was created via `claude-guardian resume <archive-id>`)
+        (or --resume <uuid> instead of --session-id: an instance created
+         via `claude-guardian resume <archive-id>`, or one coming back
+         from a reboot onto the conversation it already had)
                                     ^                       ^
                                     |                       |
                         operator: ssh + `claude-guardian     operator: claude.ai
@@ -63,9 +65,11 @@
 
 - **systemd 层**负责从以下情况恢复：重启、某个实例的监督脚本崩溃、该实例 tmux 服务端状态消失。`Restart=always` 加上有上限的 `StartLimitBurst`，防止 `claude` 真的缺失时无限重启（见 Known limitations）。`KillMode=process` 使得 `stop`/`restart`/`deactivate` 只信号给被跟踪的循环 PID，绝不波及 tmux 服务器或 `claude`（这一点是实测验证过的——systemd 默认的 `KillMode=control-group` 会把整个会话一起杀掉，所以这里必须显式设置，不能留给系统默认值）。因为它是一个*模板* unit（`claude-guardian@.service`），每个实例都是一个独立的 systemd unit 实例（`claude-guardian@work.service`、`claude-guardian@personal.service`……），可以单独启动、停止、启用或禁用，互不影响。
 - **tmux 层**负责从以下情况恢复：`claude` 进程本身因任何原因退出，而*会话*（其滚动记录、其 pty）被保留下来。这正是为什么在会话里发 Ctrl+C 是安全的、不会丢状态——只有 `claude` 退出并被重新拉起，tmux 会话本身始终存活。（注：经对真实二进制验证，Claude Code 把单次 Ctrl+C 视为"中断当前这一轮"，而不是退出——要连按两次，或者输入 `/exit`，才会真正终止进程。）所有实例共用一个 tmux 服务器（一个 `$TMUX_SOCKET`），每个实例一个以实例名命名的会话——tmux 原生就支持多会话复用，所以每个实例单独起一个服务器只会增加运维负担而没有任何好处（见 `DECISIONS.md`，2026-08-17）。
-- **会话身份**：创建时，每个实例要么拿到一个全新的 `claude --session-id <uuid>`（通过 `uuidgen` 生成），要么——如果是通过 `resume` 创建的——拿到指向此前某个归档对话的 `claude --resume <uuid>`。无论哪种情况，这个 id 都会被固化进 tmux pane 的原始启动命令里，所以每次崩溃后的 `respawn-pane` 都会自动复用同一个 id——一次重生延续的是同一段对话，绝不会悄悄分叉出一段新的。这个 id 会记录在按实例区分的状态文件里（`/var/lib/claude-guardian/state/<name>.state`），专门是为了让 `archive` 能保存它、`resume` 能复用它。
-- **无人值守保活**（见 `DECISIONS.md` 2026-08-16 "always remotely controllable"）：当 `tmux list-clients` 显示某个实例的会话无人接管时，它的循环会定期地（a）发送 Enter——间隔一秒发两次——清除 `--permission-mode auto` 在多次被分类器拦截后可能回退出现的确认弹窗；以及（b）检查 Remote Control 是否仍处于连接状态，若已断开则重新连上。只要有客户端接管，两者都会立即停止（每个 tick 都会检查一次）。`create_session` 在启动 `claude` 之后也会发送同样的双击 Enter，原因相同：一次真正的首次运行可能会出现需要两次 Enter 才能清除的引导/信任屏幕，不应该非等到第一次无人值守敲击的间隔才处理——然后它会同步记录一次链接，这样 `new` 就能立刻打印出来，不用等最多 `REMOTE_CONTROL_REFRESH_SEC` 那么久。如果 `claude` 此时已经在正常的提示符上，多发一次 Enter 也只是一次无害的空操作，所以与其去检测到底显示的是哪个屏幕，不如始终发两次。
+- **会话身份**：创建时，每个实例要么拿到一个全新的 `claude --session-id <uuid>`（通过 `uuidgen` 生成），要么拿到一个指向已有对话的 `claude --resume <uuid>`。无论哪种情况，这个 id 都会被固化进 tmux pane 的原始启动命令里，所以每次崩溃后的 `respawn-pane` 都会自动复用同一个 id——一次重生延续的是同一段对话，绝不会悄悄分叉出一段新的。这个 id 会记录在按实例区分的状态文件里（`/var/lib/claude-guardian/state/<name>.state`），这样 `archive` 能保存它、`resume` 能复用它，实例本身也能在重启之后找回同一段对话。
+- **在重启之后保住对话**：`respawn-pane` 只覆盖 `claude` 死掉、而它的 tmux 会话还活着的情况。一次重启会把整个 tmux 服务器一起带走，会话得从零重建——而在 v0.4.0 之前，这意味着每次开机都是一段崭新的空对话，之前那段虽然还留在磁盘上，却只能靠手工才能找回来。现在 `create_session` 会按以下顺序优先选择：一个显式的 `RESUME_SESSION_ID`（由 `resume <archive-id>` 设置）；实例自己状态里最近一次的 `claude_session_id`，前提是 `RESUME_AFTER_RESTART=1` 且它的 transcript 还在磁盘上；否则用 `uuidgen` 新生成一个 id。transcript 检查是让这套机制诚实的关键——它区分的正是"继续那段对话"和"把一个 `claude` 压根没听说过的 id 塞给它"。如果 `claude` 仍然拒绝这次恢复，它会立刻退出；与其让监督循环每隔 `CHECK_INTERVAL_SEC` 就把那条注定失败的命令重建一遍、永无止境，`create_session` 会在发现一次会话已死（或已消失）之后，改用一段新对话重试。
+- **无人值守保活**（见 `DECISIONS.md` 2026-08-16 "always remotely controllable"）：当 `tmux list-clients` 显示某个实例的会话无人接管时，它的循环会定期地（a）发送 Enter——间隔一秒发两次——清除一个没人回答的确认弹窗；以及（b）检查 Remote Control 是否仍处于连接状态，若已断开则重新连上。只要有客户端接管，两者都会立即停止（每个 tick 都会检查一次）。对（a）来说，"无人接管"是必要条件但不充分：循环还会问 `claude` 这个会话正在干什么，只有对一个确实停在弹窗上的会话才会敲键——见下文**什么时候才允许 nudge 敲键**。`create_session` 在启动 `claude` 之后也会发送同样的双击 Enter，原因相同：一次真正的首次运行可能会出现需要两次 Enter 才能清除的引导/信任屏幕，不应该非等到第一次无人值守 nudge 的间隔才处理——然后它会同步记录一次链接，这样 `new` 就能立刻打印出来，不用等最多 `REMOTE_CONTROL_REFRESH_SEC` 那么久。如果 `claude` 此时已经在正常的提示符上，多发一次 Enter 也只是一次无害的空操作，所以与其去检测到底显示的是哪个屏幕，不如始终发两次。
 - **"是否还连着"这个问题是怎么回答的**（见 `DECISIONS.md`，2026-08-17，"read claude's session file"）：Claude Code 会为每个正在运行的会话在 `$CLAUDE_SESSIONS_DIR`（`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions`）下写一个 JSON 文件，文件名就是该会话的 PID，其中的 `bridgeSessionId` 字段在连接期间保存 Remote Control 会话 id，一旦断开就变成 `null`。一个实例的 `claude` *就是*它的 tmux pane 命令，所以 `#{pane_pid}` 直接就指出了文件名。读这个文件同时回答了两个问题："Remote Control 还在线吗？"和"当前的 `claude.ai/code/...` 链接是什么？"，而且完全不用往会话里敲任何东西——这一点很关键，因为此刻很可能正有人通过 Remote Control 在这个会话里干活；Remote Control 不是一个 tmux 客户端，所以一个正在被使用的实例在这里看起来仍然是无人值守的。文件是按文本匹配解析的（不依赖 `jq`/`python`），并且会和实例自己的 `pid` 以及被跟踪的 `claude_session_id` 交叉核对，这样一个被复用的 PID 就不会把别人的会话交回来。只有重连这一步会发送按键：`/remote-control` 在 Remote Control 关闭时把它打开，而在已经开着的时候只是弹出一个信息性对话框（"Disconnect this session" / "Show QR code" / "Continue"），末尾补一个 Escape 就能关掉，什么都不会选中。**对一个自认为还连着的会话重新执行 `/remote-control`，什么都刷新不了**——v0.2.0 的保活机制整个建立在这个错误假设之上，这也是现在要先检查再动手的原因。
+- **什么时候才允许 nudge 敲键**（见 `DECISIONS.md`，2026-08-17，"nudge only a session that is actually parked"）：同一个会话文件里还带着一个 `status` 字段，循环是照着它来 nudge 的，而不是照着墙上时钟。它有三个取值，三个都在 2.1.202 上实地观察到了：`busy`（正在处理一轮）、`idle`（停在一个空提示符上）、`waiting`（停在一个确认弹窗上）。只有 `waiting` 才构成发送 Enter 的理由，而且还要它保持这个状态满 `UNATTENDED_NUDGE_SEC`——这个时长是从 `statusUpdatedAt` 读出来的，所以倒计时从弹窗出现的那一刻开始算，而不是从监督进程碰巧看了一眼的时刻算。其他情况一律不碰，这才终于让一个有人正在从 claude.ai 上驱动的会话变得安全：它没有 tmux 客户端，所以看起来像被遗弃了，但它读出来是 `busy` 或 `idle`，除非真的有个弹窗没人回答，否则永远不会是 `waiting`。`updatedAt` 是最先试过并被否决的：它跟踪的是状态*转换*，所以一个已经忙了二十分钟的会话，其时间戳仍然是二十分钟前的，读起来就像被遗弃了（这是在维护者自己那个正处于处理中的实时会话上观察到的）。当找不到可用的会话文件时，循环会退回到 v0.2.0 的行为，仅凭经过的时间来 nudge。
 - 两层监督在每个实例内部都是刻意独立的：`claude-guardian deactivate <name>`（即 `systemctl disable --now`）只会停掉该实例的*监督循环*；它不会杀掉其存活的 tmux 会话，所以一个正在对话中的操作者不会被例行维护打断——`activate <name>` 会针对同一个仍在运行的会话恢复监督。彻底结束单个实例是另一个独立的、明确的、破坏性的步骤：`archive <name>`（见下文）。而彻底拆除*整个工具*则是 `uninstall`（只动 systemd 模板，每个实例的配置/会话都保持不动）相对于 `purge`（一切都清：每个会话、socket、每份配置、安装的二进制文件——但绝不碰 `/var/lib/claude-guardian/archive/`，见 README）。
 - **归档 / 恢复**：`archive <name>` 先停止监督，把完整的滚动记录（`tmux capture-pane -pS -`）和该实例的 `claude_session_id` 保存到 `/var/lib/claude-guardian/archive/<name>-<ts>/`，然后杀掉 tmux 会话——这是一个刻意的、默认需要确认的破坏性操作（见 `DECISIONS.md`，2026-08-17，"archive kills the process"）。`resume <archive-id> [new-name]` 会带着设好的 `RESUME_SESSION_ID` 从那个归档重建一个实例，使得 `create_session` 传的是 `--resume <uuid>` 而不是重新铸造一个新的——操作者就此接回同一段对话。
 
@@ -95,7 +99,8 @@
 |---|---|---|
 | `claude`（Claude Code CLI） | 由操作者预先安装并完成认证——本工具不负责安装它 | root 的 `PATH` 上任意位置，或将 `CLAUDE_BIN` 指向其绝对路径 |
 | `uuidgen`（`uuid-runtime` 软件包） | 缺失时由前置检查自动安装，和 `tmux` 一样 | 每次创建/恢复实例时用一次，用来铸造或复用一个 `claude --session-id`/`--resume` 的值 |
-| Claude Code 的按会话文件（`$CLAUDE_SESSIONS_DIR/<pid>.json`，字段 `bridgeSessionId`） | 会话运行期间由 `claude` 自己写出——没有什么要安装的 | 读它来判断某个实例的 Remote Control 是否还连着，以及取得它当前的 `claude.ai/code/...` 链接。已针对 Claude Code **2.1.202** 验证；这是内部细节，不是有承诺的接口，别的版本可能不提供——那时工具会退回到从终端读取链接（见「已知局限」） |
+| Claude Code 的按会话文件（`$CLAUDE_SESSIONS_DIR/<pid>.json`，字段 `bridgeSessionId`、`status`、`statusUpdatedAt`） | 会话运行期间由 `claude` 自己写出——没有什么要安装的 | 读它来判断某个实例的 Remote Control 是否还连着、取得它当前的 `claude.ai/code/...` 链接，以及判断它是在干活、空闲，还是停在一个确认弹窗上。已针对 Claude Code **2.1.202** 验证；这是内部细节，不是有承诺的接口，别的版本可能不提供——那时工具会退回到从终端读取链接，以及按墙上时钟 nudge（见「已知局限」） |
+| Claude Code 的对话 transcript（`$CLAUDE_PROJECTS_DIR/<slugged-workdir>/<session-id>.jsonl`） | 由 `claude` 自己写出——没有什么要安装的 | 在重启之后恢复一段对话前，会检查它是否存在；目录名就是工作目录，其中每一个不在 `[A-Za-z0-9]` 范围内的字符都被替换成 `-`。已针对 **2.1.202** 验证，注意事项同上：找不到只是意味着会开一段新对话 |
 
 ### 路径与挂载
 
@@ -111,7 +116,8 @@
 | `/usr/local/bin/claude-guardian` | 本工具，`install` 时（从 `bin/claude-guardian.sh` 拷贝） | 安装后的 CLI 入口 |
 | `$TMUX_SOCKET`（默认 `/run/claude-guardian/tmux.sock`） | 本工具，运行时创建 | 每个实例共享的一个专用 tmux 服务器 socket，与任何交互式管理员自己在 `/tmp` 上的 tmux 服务器隔离 |
 | `$WORKDIR`（默认 `/root`，可按实例覆盖） | 操作者，通过配置或 `new --workdir` | `claude` 启动时所在的工作目录 |
-| `$CLAUDE_SESSIONS_DIR`（默认 `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions`） | Claude Code，不是本工具 | 只读：每个运行中的 `claude` 会话一个 JSON 文件，文件名是它的 PID；Remote Control 连接/断开检查的数据来源 |
+| `$CLAUDE_SESSIONS_DIR`（默认 `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions`） | Claude Code，不是本工具 | 只读：每个运行中的 `claude` 会话一个 JSON 文件，文件名是它的 PID；既是 Remote Control 连接/断开检查的数据来源，也是 nudge 所依据的 busy/idle/waiting 检查的数据来源 |
+| `$CLAUDE_PROJECTS_DIR`（默认 `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects`） | Claude Code，不是本工具 | 只读：对话 transcript，每个工作目录一个目录；在重启之后恢复一段对话前会检查它是否存在 |
 
 ### 配置参考
 
@@ -125,10 +131,12 @@
 | `CLAUDE_ARGS` | 每次（重）启动时附带的额外 CLI 参数 | `--permission-mode auto --remote-control` | 全局，可按实例覆盖 | 否 |
 | `CHECK_INTERVAL_SEC` | 存活检查的间隔秒数 | `5` | 全局 | 否 |
 | `REQUIRED_APT_PKGS` | 缺失时自动安装的 apt 包，空格分隔 | `tmux uuid-runtime` | 全局 | 否 |
-| `UNATTENDED_NUDGE_SEC` | 仅无人值守时生效：无 tmux 客户端接管这么多秒后，发送一次裸 Enter 清除卡住的确认弹窗；`0` 表示禁用 | `300` | 全局 | 否 |
+| `UNATTENDED_NUDGE_SEC` | 仅无人值守时生效：在没有 tmux 客户端接管的情况下，一个确认弹窗可以无人回答多久，超过之后才发送一次裸 Enter 来清除它；`0` 表示禁用。一个正在干活或停在空提示符上的会话永远不会被敲键 | `300` | 全局 | 否 |
 | `REMOTE_CONTROL_REFRESH_SEC` | 仅无人值守时生效：每隔这么多秒检查一次 Remote Control 是否仍连着（断了就重连，无论断没断都刷新存下来的链接）；`0` 表示禁用 | `1200` | 全局 | 否 |
-| `CLAUDE_SESSIONS_DIR` | Claude Code 写入其按会话 JSON 文件的位置；只读，连接/断开检查全靠它 | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions` | 全局 | 否 |
-| `MAX_SESSIONS` | 实例数达到这个值后 `new`/`resume` 会拒绝 | `3` | 全局 | 否 |
+| `CLAUDE_SESSIONS_DIR` | Claude Code 写入其按会话 JSON 文件的位置；只读，连接/断开检查和 busy/idle/waiting 检查全靠它 | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions` | 全局 | 否 |
+| `CLAUDE_PROJECTS_DIR` | Claude Code 存放对话 transcript 的位置；只读，在重启之后恢复一段对话前会检查它 | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects` | 全局 | 否 |
+| `RESUME_AFTER_RESTART` | `1`：在一次把 tmux 会话一并带走的重启之后，让实例回到它原本那段对话上；`0`：总是开一段新的 | `1` | 全局，可按实例覆盖 | 否 |
+| `MAX_SESSIONS` | 实例数达到这个值后 `new`/`resume` 会拒绝；`0` = 不限制 | `0` | 全局 | 否 |
 
 ## 从零搭建
 
@@ -142,8 +150,8 @@
 8. `claude-guardian deactivate second-instance`，然后检查 `pgrep -f 'claude --permission-mode'`——验证：两个 `claude` 进程都还在跑（deactivate 只暂停监督，见 Known limitations 里关于 `KillMode` 的说明）。再执行 `claude-guardian activate second-instance`——验证：该实例的 `claude` PID 还是同一个（监督恢复到已存在的会话上，而不是重新创建）。
 9. `claude-guardian archive second-instance --yes`——验证：`claude-guardian list` 不再显示 `second-instance`；`claude-guardian archives` 显示一条它的记录，带着保存下来的 `scrollback.txt`；`pgrep -f 'claude --permission-mode'` 只剩下 `claude-code` 那个进程。
 10. `claude-guardian resume second-instance`（或者用第 9 步得到的确切归档 id）——验证：`claude-guardian list` 再次显示 `second-instance`，且 `claude-guardian attach second-instance` 延续的是同一段对话，而不是从头开始。
-11. 从 `claude-code` 分离，放着无人值守超过 `UNATTENDED_NUDGE_SEC`——验证：`claude-guardian logs claude-code` 会在那个时间点打印一行 `sending Enter in case a prompt is stuck`，且重新接管再分离一次之后，它不会立即再次触发（计时器在接管时会重置）。而 `REMOTE_CONTROL_REFRESH_SEC` 那个 Remote Control 检查，在连接健康时是刻意保持安静的；想看到它起作用，就在会话内部断开 Remote Control（`/remote-control` → `Disconnect this session`），然后验证在 `REMOTE_CONTROL_REFRESH_SEC` 之内日志里出现 `remote control disconnected ... reconnecting`，紧跟着一个*新的*链接，并且 `claude-guardian url claude-code` 打印的就是这个新链接。
-12. `reboot` 宿主机——验证：重启后，每一个曾被 `activate`（而不是 `deactivate`）过的实例都会自动变回 `active`，不需要手动干预。
+11. 从 `claude-code` 分离，在没有任何事情正在进行的情况下放着无人值守，时间超过 `UNATTENDED_NUDGE_SEC`——验证：`claude-guardian logs claude-code` **不会**出现 `sending Enter` 那一行，因为一个空闲的提示符上没有什么可清除的。然后触发一个确认弹窗（用 `--permission-mode default` 最省事：让它执行任意一条 shell 命令），分离，放着不管——验证：到了 `UNATTENDED_NUDGE_SEC` 这个点，日志里会出现 `has been waiting on a confirmation for Ns with nobody attached`，紧跟着 `sending Enter`，并且弹窗消失了。再接管一次、再分离一次——验证它不会立即再次触发（计时器在接管时会重置）。而 `REMOTE_CONTROL_REFRESH_SEC` 那个 Remote Control 检查，在连接健康时是刻意保持安静的；想看到它起作用，就在会话内部断开 Remote Control（`/remote-control` → `Disconnect this session`），然后验证在 `REMOTE_CONTROL_REFRESH_SEC` 之内日志里出现 `remote control disconnected ... reconnecting`，紧跟着一个*新的*链接，并且 `claude-guardian url claude-code` 打印的就是这个新链接。
+12. `reboot` 宿主机——验证：重启后，每一个曾被 `activate`（而不是 `deactivate`）过的实例都会自动变回 `active`，不需要手动干预；`claude-guardian logs <name>` 会显示 `continuing this instance's previous conversation (<uuid>)`；接管进去看到的是重启之前那段对话，而不是一段空的。想不真的重启就演练一遍：`claude-guardian stop <name>`、`tmux -S /run/claude-guardian/tmux.sock kill-session -t <name>`、`claude-guardian start <name>`。
 
 本项目不是用 Docker 部署的；以上步骤就是完整的部署流程。
 
@@ -162,13 +170,13 @@ repo/
 
 ## 已知限制与坑
 
-- **`UNATTENDED_NUDGE_SEC`（自动敲 Enter）是一个刻意的、经过明确批准的安全权衡，不是一个中性的便利功能。** `--permission-mode auto` 在分类器连续拦截 3 次（或累计拦截 20 次）之后会回退到交互式确认——这个回退机制存在的意义就是让人来对分类器无法自动清除的动作做出判断。无人值守时发送一个裸 Enter，会接受当前高亮/默认的那个选项，**却并不知道那个默认选项对那个具体的弹窗来说是不是安全的选择。** 这一点是被 Claude Code 自己的 auto 模式分类器实测拦截过的——guardian 尝试以这个行为重启时被拦下（"defeats the human-in-the-loop safety fallback"），部署前需要用户明确确认（见 `DECISIONS.md`，2026-08-16）。如果这个权衡对某次部署来说不可接受，把 `UNATTENDED_NUDGE_SEC="0"` 设为禁用——文档里给出的替代方案是 `--permission-mode dontAsk` 配合一份明确的 `permissions.allow` 列表，未列出的动作会被静默拒绝，而不是靠猜一个确认弹窗（更可预测，但配置工作量更大）。
+- **`UNATTENDED_NUDGE_SEC`（自动敲 Enter）是一个刻意的、经过明确批准的安全权衡，不是一个中性的便利功能。** `--permission-mode auto` 在分类器连续拦截 3 次（或累计拦截 20 次）之后会回退到交互式确认——这个回退机制存在的意义就是让人来对分类器无法自动清除的动作做出判断。无人值守时发送一个裸 Enter，会接受当前高亮/默认的那个选项，**却并不知道那个默认选项对那个具体的弹窗来说是不是安全的选择。** 这一点是被 Claude Code 自己的 auto 模式分类器实测拦截过的——guardian 尝试以这个行为重启时被拦下（"defeats the human-in-the-loop safety fallback"），部署前需要用户明确确认（见 `DECISIONS.md`，2026-08-16）。如果这个权衡对某次部署来说不可接受，把 `UNATTENDED_NUDGE_SEC="0"` 设为禁用——文档里给出的替代方案是 `--permission-mode dontAsk` 配合一份明确的 `permissions.allow` 列表，未列出的动作会被静默拒绝，而不是靠猜一个确认弹窗（更可预测，但配置工作量更大）。v0.4.0 收窄的只是*这件事可能落到谁头上*：现在这个 Enter 只会发给一个 `claude` 自己报告为 `waiting` 的会话，而且还要等弹窗无人回答满整个间隔。所以一个有人正在里面工作的会话不会再被敲键。残留的情况是：一个人在 claude.ai 上打开了一个弹窗，然后把它晾了超过 `UNATTENDED_NUDGE_SEC`，但其实还打算回来回答它——从外面看，这和一个被遗弃的会话没有区别，于是这个弹窗会被代为回答。如果这一点对你很重要，把间隔调大。
 - **`claude-guardian install`/`new` 会非交互式地自动安装缺失的 apt 包**（`DEBIAN_FRONTEND=noninteractive apt-get install -y`）。默认情况下是 `tmux` 和 `uuid-runtime`。如果你扩大了 `REQUIRED_APT_PKGS`，请自行审查你在无人值守的情况下要求它安装的是什么。
 - **`claude` 二进制缺失会让某个实例的 service 失败循环大约一分钟，然后停下。** `preflight_enforce` 在找不到 `claude` 时会硬性失败（这是设计如此——本工具从不负责安装它）。unit 里的 `StartLimitBurst=10` / `StartLimitIntervalSec=60` 会阻止 systemd 无限重启；之后该实例会停在 `failed` 状态，直到你装好 `claude` 并执行 `systemctl reset-failed claude-guardian@<name> && claude-guardian start <name>`。
 - **`claude-guardian deactivate <name>`（即 `systemctl disable --now`）不会杀掉存活的会话——这依赖 unit 里的 `KillMode=process`，已对真实二进制验证过。** systemd 的*默认* `KillMode` 是 `control-group`，会在 stop/restart 时对整个 cgroup 发 SIGTERM，包括 tmux 服务器和 `claude` 本身（这是实测抓到的：unit 最初的版本没有显式设置 `KillMode`，一次 `systemctl restart` 就悄悄杀掉并重建了会话）。设了 `KillMode=process` 之后，只有被跟踪的循环 PID 会收到信号，所以 `claude` 和它的 tmux 会话能扛过该实例监督进程的 `stop`/`restart`/`deactivate`。一个副作用：systemd 会在下次 `start` 时记录一条无害的 `Found left-over process ... in control group` 提示，因为之前的 `claude` 进程还留在那个 cgroup 里——这是预期行为，不是错误。要真正结束某个实例的对话，用 `claude-guardian archive <name>`（破坏性操作，默认要确认）；要拆掉一切，用 `claude-guardian purge`（同样默认要确认，且不会动归档——见下文）。
 - **`purge` 的影响范围从"一个会话"变成了"每一个存活的实例"**，这是加入多实例支持时带来的变化（见 `DECISIONS.md`，2026-08-17）。它现在会打印当前存活的实例数，并在动手之前要求交互式确认（或传 `--yes`），且刻意从不删除 `/var/lib/claude-guardian/archive/`——想彻底删掉某个归档，要用 `rm-archive` 显式操作。
-- **判断 Remote Control 是否还在线，依赖的是 Claude Code 的一个内部文件。** `$CLAUDE_SESSIONS_DIR/<pid>.json` 及其 `bridgeSessionId` 字段不是有文档、有承诺的接口；未来某个版本的 Claude Code 可能改名、挪位置，或干脆不再写它。已针对 2.1.202 验证。当这个文件缺失或读不了时，工具是降级而不是崩溃：它会退回到发送 `/remote-control` 并从屏幕上读取链接——这正是 v0.2.0 一直以来的做法。这条路径和这个兜底都是刻意设计的，而且 `CLAUDE_SESSIONS_DIR` 可以在配置里覆盖，所以文件挪了位置也不用改脚本。
-- **重连 Remote Control 会往 tmux pane 里发送真实的按键**（`C-u`、`/remote-control`、`Escape`），实例创建时的首次捕获也一样（紧跟在引导阶段的双击 Enter 之后）。和 v0.2.0 不同的是，这不再由定时器触发——只有上面那个检查确认 Remote Control 真的断了才会发生——但如果 `claude` 恰好意外地停在正常提示符以外的某个屏幕上（比如引导流程超出了已经发送的那两次 Enter），这些按键就可能被敲进错误的地方。无害（这一步不会自动确认任何东西，而且 Escape 是关闭而不是选中），但可能留下需要手动用 `claude-guardian attach <name>` 清理的杂散文本。这和双击 Enter 清除引导屏幕、以及无人值守敲击是同一类已被接受的"盲发按键"权衡，参见上面 `UNATTENDED_NUDGE_SEC` 那条。
+- **现在有三处行为依赖 Claude Code 的内部文件。** `$CLAUDE_SESSIONS_DIR/<pid>.json`（字段 `bridgeSessionId`、`status`、`statusUpdatedAt`）和 `$CLAUDE_PROJECTS_DIR/<slugged-workdir>/<id>.jsonl` 都不是有文档、有承诺的接口；未来某个版本的 Claude Code 可能改名、挪位置，或干脆不再写它们。三处都已针对 2.1.202 验证。当对应文件缺失或读不了时，每一处都是降级而不是崩溃：连接检查会退回到发送 `/remote-control` 并从屏幕上读取链接（这正是 v0.2.0 一直以来的做法），nudge 会退回到墙上时钟（也是 v0.2.0 的行为），而一次无法确认的恢复就干脆开一段新对话。两个路径都可以在配置里覆盖（`CLAUDE_SESSIONS_DIR`、`CLAUDE_PROJECTS_DIR`），所以文件挪了位置也不用改脚本。transcript 目录名是这样推导出来的：把工作目录里每一个不在 `[A-Za-z0-9]` 范围内的字符替换成 `-`；如果这个约定变了，重启后恢复对话就会悄无声息地再也找不到 transcript，每次重启又会从一段新对话开始——这就是要留意的症状，因为不会有任何报错。
+- **重连 Remote Control 会往 tmux pane 里发送真实的按键**（`C-u`、`/remote-control`、`Escape`），实例创建时的首次捕获也一样（紧跟在引导阶段的双击 Enter 之后）。和 v0.2.0 不同的是，这不再由定时器触发——只有上面那个检查确认 Remote Control 真的断了才会发生——但如果 `claude` 恰好意外地停在正常提示符以外的某个屏幕上（比如引导流程超出了已经发送的那两次 Enter），这些按键就可能被敲进错误的地方。无害（这一步不会自动确认任何东西，而且 Escape 是关闭而不是选中），但可能留下需要手动用 `claude-guardian attach <name>` 清理的杂散文本。这和双击 Enter 清除引导屏幕、以及无人值守 nudge 是同一类已被接受的"盲发按键"权衡，参见上面 `UNATTENDED_NUDGE_SEC` 那条。
 - **一次重连会改变实例的 `claude.ai/code/...` 链接。** 对话本身不受影响——还是同一个 `claude` 进程、同一个 `claude_session_id`——但之前收藏的链接会失效。既要真正重连、又要保住旧链接是做不到的，所以工具选择保证连接可用，并且预期链接是按需取（`claude-guardian url <name>`）而不是存下来备用。
 - **`resume` 只有在归档里记录了 `claude_session_id` 的情况下才能重建对话。** 由本工具自己的 `archive` 命令生成的归档永远满足这一点（这个 id 在实例创建时就已捕获并一路带过来），但如果某个归档目录被手工改动过，或者 `meta.env` 丢了，`resume` 会拒绝执行，转而指向原始的 `scrollback.txt`，而不是去瞎猜。
 - **`install` 会原地迁移一个 v0.1.0 的单实例部署**（`migrate_legacy_unit`）：它会禁用/移除旧的 `claude-guardian.service`，并针对*同一个* tmux 会话启用新的 `claude-guardian@claude-code.service`。这依赖新旧两个 unit 里都设了 `KillMode=process`（上面已验证过）——如果未来某次 systemd unit 改动不小心把这个设置去掉了，这条迁移路径就需要针对一个存活会话重新验证一遍，才能再信任它。已在一台真实的生产主机上验证过：`install` 执行前后，tmux pane 的 PID 和存活状态都没有变化。
@@ -177,7 +185,7 @@ repo/
 - **如果这个仓库的工作副本放在挂载了固定 `file_mode` 选项的 CIFS/SMB 文件系统上（NAS 支持的开发环境很常见），对 `bin/claude-guardian.sh` 执行 `chmod +x` 可能会静默地什么都不做**（退出码 0，权限位却没变——开发过程中真的碰到过）。可执行位是在提交时直接记录进 git 树里的（`git update-index --chmod=+x bin/claude-guardian.sh`），所以一次正常的 `git clone` 只要落在支持真实权限位的文件系统上，检出来的文件就会自带可执行权限。如果你本地的工作副本保不住这个可执行位，就显式用 `bash bin/claude-guardian.sh ...` 调用，而不是 `./bin/claude-guardian.sh`。
 - **登录状态只在 `install` 时被强制检查，不是持续检查的。** `install` 在 `claude auth status` 失败时会硬性拒绝（已针对两种真实状态验证过：已登录，以及一个没有任何凭据的隔离 `HOME`——分别退出码 0 和 1）。安装完之后，`run` 只在认证缺失或后来丢失时发出警告——service 会继续重试，`claude` 会在下次有人接管时展示它正常的交互式登录流程，而不是拒绝启动。这是刻意如此，不是疏漏：一个原本正常工作、后来丢失认证（token 过期、会话被吊销）的 service，应该继续尝试提供服务，而不是陷入重启失败循环。
 - **`REMOTE_CONTROL_REFRESH_SEC` 默认的 1200 秒只限定了一次掉线最长能被忽视多久，别的什么都不代表。** v0.2.0 选 20 分钟是为了卡在 Anthropic 文档里那个约 30 分钟的"无法连接 Remote Control 服务器"窗口之内，前提假设是提前重新执行一次 `/remote-control` 就能让连接永不过期。这个假设是错的（见 `DECISIONS.md`，2026-08-17），所以这个数字现在的含义简单得多：一次掉线最多在这么多秒内被发现并修复。调小它就缩短了中断时间；这个检查只是读一个文件，调小的成本很低。
-- **无人值守敲击/刷新的计时器只从监督循环自身（重新）启动的那一刻开始计数，而不是从会话实际最后一次被接管的时刻算起。** 这是实测抓到的一个真实 bug：最初的版本把两个计时器都初始化为 `0`（纪元时间），导致针对一个已经无人值守的会话执行 `systemctl restart` 会立刻触发一次敲击和刷新，而不是先把配置的间隔跑完。修复方式是在循环启动时把两个计时器都设成当前时间。
+- **无人值守 nudge/刷新的计时器只从监督循环自身（重新）启动的那一刻开始计数，而不是从会话实际最后一次被接管的时刻算起。** 这是实测抓到的一个真实 bug：最初的版本把两个计时器都初始化为 `0`（纪元时间），导致针对一个已经无人值守的会话执行 `systemctl restart` 会立刻触发一次 nudge 和刷新，而不是先把配置的间隔跑完。修复方式是在循环启动时把两个计时器都设成当前时间。
 
 ## 如何扩展
 

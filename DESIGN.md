@@ -43,9 +43,12 @@
   just sit respawning a session nobody can use), while `run` only warns,
   so an instance that later loses auth keeps retrying instead of refusing
   to start.
-- Bound resource/cost growth: `new` refuses once `MAX_SESSIONS` concurrent
-  instances already exist (default 3) — each instance is a separate
-  `claude` process and a separate token cost.
+- Offer a guardrail on resource/cost growth without imposing one: `new`
+  refuses once `MAX_SESSIONS` concurrent instances already exist — each
+  instance is a separate `claude` process and a separate token cost. The
+  default is `0` (no limit), because the number of concurrent conversations
+  an operator wants is a workflow decision, not something this tool can
+  guess; the knob exists for whoever does want a ceiling.
 - Be operable with a small, memorable CLI (`claude-guardian <verb>
   [<name>]`).
 
@@ -79,10 +82,11 @@ one systemd unit instance and one tmux session per `claude-guardian
    claude-guardian@<name>.service    |
    (one instance per name,           | every CHECK_INTERVAL_SEC:
     from a template unit)            | tmux has-session? / pane_dead? / client attached?
-                                      | (if unattended: nudge Enter / check that
-                                      |  Remote Control is still connected and
-                                      |  reconnect it if not — on their own
-                                      |  longer intervals, see below)
+                                      | (if unattended: clear a dialog nobody
+                                      |  answered / check that Remote Control
+                                      |  is still connected and reconnect it
+                                      |  if not — on their own longer
+                                      |  intervals, see below)
                                       v
                      tmux session "<name>" (remain-on-exit on)
                      — one of possibly several, all on the same
@@ -90,8 +94,9 @@ one systemd unit instance and one tmux session per `claude-guardian
                                     |
                                     v
         claude --permission-mode auto --remote-control --session-id <uuid>
-        (or --resume <uuid> instead of --session-id, if this instance
-         was created via `claude-guardian resume <archive-id>`)
+        (or --resume <uuid> instead of --session-id: an instance created
+         via `claude-guardian resume <archive-id>`, or one coming back
+         from a reboot onto the conversation it already had)
                                     ^                       ^
                                     |                       |
                         operator: ssh + `claude-guardian     operator: claude.ai
@@ -128,21 +133,40 @@ one systemd unit instance and one tmux session per `claude-guardian
   server per instance would add operational overhead for no benefit (see
   `DECISIONS.md`, 2026-08-17).
 - **session identity**: at creation, each instance is handed either a
-  fresh `claude --session-id <uuid>` (generated via `uuidgen`) or, if it
-  was created by `resume`, `claude --resume <uuid>` pointing at a
-  previously-archived conversation. Either way the id is baked into the
-  tmux pane's original command line, so every `respawn-pane` after a crash
-  automatically reuses the same id — a respawn continues the same
-  conversation, it never silently forks a new one. The id is recorded in
-  per-instance state (`/var/lib/claude-guardian/state/<name>.state`)
-  specifically so `archive` can save it and `resume` can reuse it.
+  fresh `claude --session-id <uuid>` (generated via `uuidgen`) or a
+  `claude --resume <uuid>` pointing at an existing conversation. Either way
+  the id is baked into the tmux pane's original command line, so every
+  `respawn-pane` after a crash automatically reuses the same id — a respawn
+  continues the same conversation, it never silently forks a new one. The id
+  is recorded in per-instance state
+  (`/var/lib/claude-guardian/state/<name>.state`) so `archive` can save it,
+  `resume` can reuse it, and the instance can find its way back to the same
+  conversation after a restart.
+- **surviving a reboot with the conversation intact**: `respawn-pane` only
+  covers `claude` dying while its tmux session lives on. A reboot takes the
+  whole tmux server with it, so the session is built from scratch — and
+  before v0.4.0 that meant a brand-new empty conversation on every boot,
+  with the previous one left on disk, reachable only by hand. Now
+  `create_session` prefers, in order: an explicit `RESUME_SESSION_ID` (set
+  by `resume <archive-id>`); the instance's own last `claude_session_id`
+  from state, if `RESUME_AFTER_RESTART=1` and its transcript is still on
+  disk; otherwise a fresh `uuidgen` id. The transcript check is what keeps
+  this honest — it is the difference between "continue that conversation"
+  and "hand `claude` an id it has never heard of". If `claude` rejects the
+  resume anyway it exits immediately, and rather than let the supervisor
+  rebuild that same failing command every `CHECK_INTERVAL_SEC` forever,
+  `create_session` notices the dead (or vanished) session once and retries
+  with a new conversation.
 - **unattended keepalive** (see `DECISIONS.md` 2026-08-16 "always remotely
   controllable"): when `tmux list-clients` shows nobody attached to an
   instance's session, its loop periodically (a) sends Enter — twice, one
-  second apart — to clear any confirmation `--permission-mode auto` fell
-  back to after repeated classifier blocks, and (b) checks that Remote
-  Control is still connected, reconnecting it if it isn't. Both stop
-  immediately once a client attaches (checked every tick). `create_session`
+  second apart — to clear a confirmation dialog nobody has answered, and
+  (b) checks that Remote Control is still connected, reconnecting it if it
+  isn't. Both stop immediately once a client attaches (checked every tick).
+  "Nobody attached" is necessary but not sufficient for (a): the loop also
+  asks `claude` what the session is doing, and only types into one that is
+  actually parked on a dialog — see **when the nudge is allowed to type**
+  below. `create_session`
   sends the same double Enter right after starting `claude`, for the same
   reason: a genuinely first-ever run can show an onboarding/trust screen
   that needs two Enters to clear, and that shouldn't have to wait for the
@@ -174,6 +198,24 @@ one systemd unit instance and one tmux session per `claude-guardian
   **Re-running `/remote-control` on a session that still believes it is
   connected refreshes nothing** — that mistaken assumption was the whole
   basis of the v0.2.0 keepalive, and is why this checks before acting.
+- **when the nudge is allowed to type** (see `DECISIONS.md`, 2026-08-17
+  "nudge only a session that is actually parked"): the same session file
+  carries a `status` field, and the loop nudges on that rather than on the
+  wall clock. Three values, all three observed live on 2.1.202: `busy`
+  (mid-turn), `idle` (sitting at an empty prompt), and `waiting` (parked on
+  a confirmation dialog). Only `waiting` justifies sending Enter, and only
+  once it has held that status for `UNATTENDED_NUDGE_SEC` — read from
+  `statusUpdatedAt`, so the countdown starts when the dialog appeared, not
+  when the supervisor happened to look. Everything else is left alone,
+  which is what finally makes a session someone is driving from claude.ai
+  safe: it has no tmux client, so it looks abandoned, but it reads `busy`
+  or `idle`, never `waiting`, unless a dialog really is sitting there
+  unanswered. `updatedAt` was tried first and rejected: it tracks status
+  *transitions*, so a session that had been busy for twenty minutes still
+  carried a twenty-minute-old timestamp and read as abandoned (observed on
+  the maintainer's own live session while it was mid-turn). When no usable
+  session file exists the loop falls back to the v0.2.0 behaviour of
+  nudging on elapsed time alone.
 - The two layers are deliberately independent per instance:
   `claude-guardian deactivate <name>` (`systemctl disable --now`) only
   stops that instance's *supervision loop*; it does not kill its live
@@ -222,7 +264,8 @@ Rejected alternatives and the reasoning behind each choice live in
 |---|---|---|
 | `claude` (Claude Code CLI) | installed and authenticated by the operator beforehand — this tool does not install it | anywhere on `root`'s `PATH`, or point `CLAUDE_BIN` at an absolute path |
 | `uuidgen` (`uuid-runtime` package) | auto-installed by preflight if missing, like `tmux` | used once per instance creation/resume to mint or reuse a `claude --session-id`/`--resume` value |
-| Claude Code's per-session files (`$CLAUDE_SESSIONS_DIR/<pid>.json`, field `bridgeSessionId`) | written by `claude` itself while a session runs — nothing to install | read to tell whether an instance's Remote Control is still connected, and to get its current `claude.ai/code/...` URL. Verified against Claude Code **2.1.202**; this is an internal detail, not a promised interface, so a different version may not provide it — the tool then falls back to reading the URL off the terminal (see Known limitations) |
+| Claude Code's per-session files (`$CLAUDE_SESSIONS_DIR/<pid>.json`, fields `bridgeSessionId`, `status`, `statusUpdatedAt`) | written by `claude` itself while a session runs — nothing to install | read to tell whether an instance's Remote Control is still connected, to get its current `claude.ai/code/...` URL, and to tell whether it is working, idle, or parked on a confirmation dialog. Verified against Claude Code **2.1.202**; these are internal details, not a promised interface, so a different version may not provide them — the tool then falls back to reading the URL off the terminal and to the wall-clock nudge (see Known limitations) |
+| Claude Code's conversation transcripts (`$CLAUDE_PROJECTS_DIR/<slugged-workdir>/<session-id>.jsonl`) | written by `claude` itself — nothing to install | existence is checked before resuming a conversation after a restart; the directory name is the working directory with every character outside `[A-Za-z0-9]` replaced by `-`. Verified against **2.1.202**, same caveat as above: a miss just means a new conversation is started |
 
 ### Paths & mounts
 
@@ -238,7 +281,8 @@ Every path below is configurable only via the constants near the top of `bin/cla
 | `/usr/local/bin/claude-guardian` | this tool, on `install` (copied from `bin/claude-guardian.sh`) | the installed CLI entry point |
 | `$TMUX_SOCKET` (default `/run/claude-guardian/tmux.sock`) | this tool, created at runtime | one dedicated tmux server socket shared by every instance, isolated from any interactive admin's own tmux server on `/tmp` |
 | `$WORKDIR` (default `/root`, overridable per instance) | operator, via config or `new --workdir` | working directory `claude` starts in |
-| `$CLAUDE_SESSIONS_DIR` (default `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions`) | Claude Code, not this tool | read-only: one JSON file per running `claude` session, named after its PID; source of the Remote Control connected/disconnected check |
+| `$CLAUDE_SESSIONS_DIR` (default `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions`) | Claude Code, not this tool | read-only: one JSON file per running `claude` session, named after its PID; source of the Remote Control connected/disconnected check and of the busy/idle/waiting check the nudge gates on |
+| `$CLAUDE_PROJECTS_DIR` (default `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects`) | Claude Code, not this tool | read-only: conversation transcripts, one directory per working directory; checked for existence before resuming a conversation after a restart |
 
 ### Configuration reference
 
@@ -252,10 +296,12 @@ Global variables live in `/etc/claude-guardian/config.env`, a plain `KEY="value"
 | `CLAUDE_ARGS` | extra CLI args passed on every (re)start | `--permission-mode auto --remote-control` | global, overridable per instance | no |
 | `CHECK_INTERVAL_SEC` | seconds between liveness checks | `5` | global | no |
 | `REQUIRED_APT_PKGS` | space-separated apt packages auto-installed if missing | `tmux uuid-runtime` | global | no |
-| `UNATTENDED_NUDGE_SEC` | unattended-only: seconds of no attached tmux client before sending a bare Enter to clear a stuck confirmation prompt; `0` disables | `300` | global | no |
+| `UNATTENDED_NUDGE_SEC` | unattended-only: how long a confirmation dialog may sit unanswered, with no tmux client attached, before a bare Enter is sent to clear it; `0` disables. A session that is working or at an empty prompt is never typed into | `300` | global | no |
 | `REMOTE_CONTROL_REFRESH_SEC` | unattended-only: seconds between checks that Remote Control is still connected (reconnecting if not, and refreshing the stored URL either way); `0` disables | `1200` | global | no |
-| `CLAUDE_SESSIONS_DIR` | where Claude Code writes its per-session JSON files; read-only, and what makes the connected/disconnected check possible | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions` | global | no |
-| `MAX_SESSIONS` | `new`/`resume` refuse once this many instances already exist | `3` | global | no |
+| `CLAUDE_SESSIONS_DIR` | where Claude Code writes its per-session JSON files; read-only, and what makes the connected/disconnected and busy/idle/waiting checks possible | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions` | global | no |
+| `CLAUDE_PROJECTS_DIR` | where Claude Code keeps conversation transcripts; read-only, checked before resuming a conversation after a restart | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects` | global | no |
+| `RESUME_AFTER_RESTART` | `1`: after a restart that took the tmux session with it, bring the instance back on the conversation it already had; `0`: always start a new one | `1` | global, overridable per instance | no |
+| `MAX_SESSIONS` | `new`/`resume` refuse once this many instances already exist; `0` = no limit | `0` | global | no |
 
 ## Setup from scratch
 
@@ -269,8 +315,8 @@ Global variables live in `/etc/claude-guardian/config.env`, a plain `KEY="value"
 8. `claude-guardian deactivate second-instance` then check `pgrep -f 'claude --permission-mode'` — verify: both `claude` processes are still running (deactivate only pauses supervision, see Known limitations on `KillMode`). `claude-guardian activate second-instance` again — verify: the same `claude` PID for that instance is still there (supervision resumes against the existing session instead of recreating it).
 9. `claude-guardian archive second-instance --yes` — verify: `claude-guardian list` no longer shows `second-instance`; `claude-guardian archives` shows one entry for it with a saved `scrollback.txt`; `pgrep -f 'claude --permission-mode'` shows only the `claude-code` process remains.
 10. `claude-guardian resume second-instance` (or the exact archive id from step 9) — verify: `claude-guardian list` shows `second-instance` again, and `claude-guardian attach second-instance` continues the same conversation instead of starting fresh.
-11. Detach from `claude-code` and leave it unattended for longer than `UNATTENDED_NUDGE_SEC` — verify: `claude-guardian logs claude-code` shows a `sending Enter in case a prompt is stuck` line at that mark, and that it does not fire again immediately after you reattach and detach once more (timers reset on attach). The Remote Control check at `REMOTE_CONTROL_REFRESH_SEC` is deliberately silent while the connection is healthy; to see it work, disconnect Remote Control from inside the session (`/remote-control` → `Disconnect this session`) and verify that within `REMOTE_CONTROL_REFRESH_SEC` the log shows `remote control disconnected ... reconnecting` followed by a *new* URL, and that `claude-guardian url claude-code` prints that new URL.
-12. `reboot` the host — verify: after boot, every instance that was `activate`d (not `deactivate`d) is `active` again without manual intervention.
+11. Detach from `claude-code` and leave it unattended for longer than `UNATTENDED_NUDGE_SEC` with nothing in progress — verify: `claude-guardian logs claude-code` shows **no** `sending Enter` line, because an idle prompt has nothing to clear. Then trigger a confirmation dialog (easiest with `--permission-mode default`: ask it to run any shell command), detach, and leave it — verify: at the `UNATTENDED_NUDGE_SEC` mark the log shows `has been waiting on a confirmation for Ns with nobody attached` followed by `sending Enter`, and the dialog is gone. Reattach and detach once more — verify it does not fire again immediately (timers reset on attach). The Remote Control check at `REMOTE_CONTROL_REFRESH_SEC` is deliberately silent while the connection is healthy; to see it work, disconnect Remote Control from inside the session (`/remote-control` → `Disconnect this session`) and verify that within `REMOTE_CONTROL_REFRESH_SEC` the log shows `remote control disconnected ... reconnecting` followed by a *new* URL, and that `claude-guardian url claude-code` prints that new URL.
+12. `reboot` the host — verify: after boot, every instance that was `activate`d (not `deactivate`d) is `active` again without manual intervention, `claude-guardian logs <name>` shows `continuing this instance's previous conversation (<uuid>)`, and attaching shows the conversation from before the reboot rather than an empty one. To rehearse this without rebooting: `claude-guardian stop <name>`, `tmux -S /run/claude-guardian/tmux.sock kill-session -t <name>`, `claude-guardian start <name>`.
 
 This project is not deployed with Docker; steps above are the full deployment procedure.
 
@@ -309,6 +355,14 @@ sufficient, without needing the rest of the repo.
   documented alternative is `--permission-mode dontAsk` with an explicit
   `permissions.allow` list, which denies unlisted actions silently instead
   of guessing at a confirmation dialog (more predictable, more setup work).
+  What v0.4.0 narrows is only *who* it can happen to: the Enter now goes
+  only to a session `claude` itself reports as `waiting`, and only after
+  the dialog has gone unanswered for the full interval, so a session
+  somebody is working in is no longer typed into. The residual case is a
+  human on claude.ai who opens a dialog and then leaves it for longer than
+  `UNATTENDED_NUDGE_SEC` while still intending to answer it — from the
+  outside that is indistinguishable from an abandoned session, and it will
+  be answered on their behalf. Raise the interval if that matters.
 - **`claude-guardian install`/`new` auto-install missing apt packages
   non-interactively** (`DEBIAN_FRONTEND=noninteractive apt-get install -y`).
   By default this is `tmux` and `uuid-runtime`. If you widen
@@ -343,16 +397,22 @@ sufficient, without needing the rest of the repo.
   deliberately never deletes `/var/lib/claude-guardian/archive/` — remove
   individual archives explicitly with `rm-archive` if you want them gone
   too.
-- **Knowing whether Remote Control is still up depends on an internal
-  Claude Code file.** `$CLAUDE_SESSIONS_DIR/<pid>.json` and its
-  `bridgeSessionId` field are not a documented, promised interface; a
-  future Claude Code may rename, move, or stop writing them. Verified
-  against 2.1.202. When the file is absent or unreadable the tool degrades
-  rather than breaks: it falls back to sending `/remote-control` and
-  reading the URL off the screen, which is what v0.2.0 always did. Both the
-  path and the fallback are deliberate, and `CLAUDE_SESSIONS_DIR` is
-  overridable in the config so a moved file can be pointed at without
-  patching the script.
+- **Three behaviours now depend on internal Claude Code files.**
+  `$CLAUDE_SESSIONS_DIR/<pid>.json` (fields `bridgeSessionId`, `status`,
+  `statusUpdatedAt`) and `$CLAUDE_PROJECTS_DIR/<slugged-workdir>/<id>.jsonl`
+  are not a documented, promised interface; a future Claude Code may
+  rename, move, or stop writing them. All verified against 2.1.202. Each
+  degrades rather than breaks when its file is absent or unreadable:
+  the connected check falls back to sending `/remote-control` and reading
+  the URL off the screen (what v0.2.0 always did), the nudge falls back to
+  the wall clock (also v0.2.0 behaviour), and a resume that cannot be
+  confirmed simply starts a new conversation. Both paths are overridable in
+  the config (`CLAUDE_SESSIONS_DIR`, `CLAUDE_PROJECTS_DIR`) so a moved file
+  can be pointed at without patching the script. The transcript directory
+  name is derived by replacing every character outside `[A-Za-z0-9]` in the
+  working directory with `-`; if that convention changes, resume-after-reboot
+  silently stops finding transcripts and every reboot starts a fresh
+  conversation again — the symptom to look for, since nothing errors.
 - **Reconnecting Remote Control sends literal keystrokes (`C-u`,
   `/remote-control`, `Escape`) into the tmux pane**, as does the initial
   capture at instance creation (right after the onboarding double-Enter).

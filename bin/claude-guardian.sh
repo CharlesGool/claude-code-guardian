@@ -77,9 +77,10 @@ CLAUDE_BIN="claude"
 CLAUDE_ARGS="--permission-mode auto --remote-control"
 CHECK_INTERVAL_SEC="5"
 REQUIRED_APT_PKGS="tmux uuid-runtime"
-# When nobody is attached (no tmux client) for this many seconds, send a bare
-# Enter keystroke to clear any confirmation prompt auto mode fell back to
-# after repeated classifier blocks. 0 disables. See DESIGN.md Known limitations.
+# When no tmux client is attached and claude has been parked on a
+# confirmation dialog for this many seconds, send a bare Enter keystroke to
+# clear it. Nothing is ever sent to a session that is working or sitting at
+# a prompt. 0 disables. See DESIGN.md Known limitations.
 UNATTENDED_NUDGE_SEC="300"
 # How often to check that Remote Control is still connected, and reconnect
 # it if it isn't. The check itself is passive (it reads claude's own session
@@ -93,9 +94,19 @@ REMOTE_CONTROL_REFRESH_SEC="1200"
 # claude.ai URL?" — see DECISIONS.md for why it replaced scraping the
 # terminal, and DESIGN.md for the fallback when the file is absent.
 CLAUDE_SESSIONS_DIR="${CLAUDE_CONFIG_DIR:-${HOME:-/root}/.claude}/sessions"
+# Claude Code keeps one transcript per conversation here, in a directory
+# named after the working directory that conversation ran in. Read to answer
+# "does the conversation this instance had before the restart still exist?"
+# — see RESUME_AFTER_RESTART below.
+CLAUDE_PROJECTS_DIR="${CLAUDE_CONFIG_DIR:-${HOME:-/root}/.claude}/projects"
+# 1: when an instance's tmux session has to be recreated (a reboot takes the
+# tmux server with it), continue the conversation that instance had before
+# instead of opening an empty one. 0: always start a new conversation.
+RESUME_AFTER_RESTART="1"
 # `new` refuses once this many instances already exist — each concurrent
 # instance is a separate claude process and a separate token cost.
-MAX_SESSIONS="3"
+# 0 = no limit.
+MAX_SESSIONS="0"
 
 if [ -r "$CONFIG_FILE" ]; then
   # shellcheck disable=SC1090
@@ -320,14 +331,44 @@ has_attached_client() {
   [ -n "$(tmux_cmd list-clients -t "$1" 2>/dev/null)" ]
 }
 
+# Path to the transcript Claude Code keeps for one conversation, or failure
+# if that conversation is not on disk. The directory is named after the
+# working directory the conversation ran in, with every character outside
+# [A-Za-z0-9] replaced by '-' (verified against Claude Code 2.1.202). Like
+# bridgeSessionId this is an internal detail rather than a promised
+# interface, so the path is configurable (CLAUDE_PROJECTS_DIR) and a miss
+# degrades to starting a new conversation instead of failing.
+transcript_path() {
+  local id="$1" workdir="$2" slug f
+  [ -n "$id" ] || return 1
+  slug=$(printf '%s' "$workdir" | sed 's/[^A-Za-z0-9]/-/g')
+  f="$CLAUDE_PROJECTS_DIR/$slug/$id.jsonl"
+  [ -r "$f" ] || return 1
+  echo "$f"
+}
+
+# $2=1 forces a brand-new conversation, ignoring both RESUME_SESSION_ID and
+# RESUME_AFTER_RESTART. Used by the fallback below, after a --resume that
+# claude refused.
 create_session() {
-  local name="$1" extra_args
+  local name="$1" force_new="${2:-0}" extra_args resumed=0 prev
   log "creating tmux session '$name' and starting claude"
 
-  if [ -n "${RESUME_SESSION_ID:-}" ]; then
+  if [ "$force_new" -eq 0 ] && [ -n "${RESUME_SESSION_ID:-}" ]; then
     extra_args="--resume $RESUME_SESSION_ID"
     state_set "$name" claude_session_id "$RESUME_SESSION_ID"
+    resumed=1
     log "resuming archived conversation $RESUME_SESSION_ID"
+  elif [ "$force_new" -eq 0 ] && [ "${RESUME_AFTER_RESTART:-1}" = "1" ] \
+       && prev=$(state_get "$name" claude_session_id) && [ -n "$prev" ] \
+       && transcript_path "$prev" "$WORKDIR" >/dev/null; then
+    # A reboot takes the tmux server with it, so the session is recreated
+    # from scratch — without this the instance would come back on an empty
+    # conversation and the previous one would be left orphaned on disk,
+    # reachable only by hand with `claude --resume`.
+    extra_args="--resume $prev"
+    resumed=1
+    log "continuing this instance's previous conversation ($prev)"
   else
     local uuid
     uuid=$(uuidgen)
@@ -361,6 +402,25 @@ create_session() {
   # screen; harmless, but it may need a manual '/remote-control' afterwards.
   # See DESIGN.md Known limitations.
   sleep 1
+
+  # A --resume claude refuses (transcript unreadable, an id it no longer
+  # knows, an incompatible version) makes it exit right away — and the
+  # supervisor would then keep recreating the session with that same failing
+  # command, every CHECK_INTERVAL_SEC, forever. Fall back to a new
+  # conversation once instead: losing the history is bad, an instance that
+  # never comes back is worse.
+  #
+  # Both halves of the test are needed. `remain-on-exit` is only set after
+  # new-session returns, so a claude that exits within those first
+  # milliseconds takes the whole tmux session with it (no session at all);
+  # one that exits slightly later leaves a dead pane behind.
+  if [ "$resumed" -eq 1 ] && { ! session_exists "$name" || pane_is_dead "$name"; }; then
+    log "warning: claude exited immediately with '$extra_args' — starting a new conversation instead"
+    tmux_cmd kill-session -t "$name" 2>/dev/null
+    create_session "$name" 1
+    return
+  fi
+
   capture_remote_control_url "$name" || true
 }
 
@@ -376,7 +436,8 @@ respawn_pane() {
 # Sending Enter accepts whatever is currently highlighted/default. Two
 # presses, not one: some prompts (e.g. first-run onboarding) need a second
 # Enter to actually clear, and an extra Enter once claude is already at its
-# normal prompt is a harmless no-op.
+# normal prompt is a harmless no-op. The caller decides *when* this is
+# appropriate — see supervise_loop and session_status_of.
 nudge_enter() {
   local name="$1"
   log "no attached client for ${UNATTENDED_NUDGE_SEC}s+ — sending Enter (x2) in case a prompt is stuck waiting for confirmation"
@@ -400,8 +461,8 @@ instance_pid() {
 # No jq/python dependency on purpose — the fields are matched textually, and
 # a disconnected session writes `"bridgeSessionId": null`, which cannot
 # match a quoted-string pattern.
-bridge_url_of() {
-  local name="$1" pid f bridge tracked recorded
+session_json_of() {
+  local name="$1" pid f tracked recorded
   pid=$(instance_pid "$name")
   [ -n "$pid" ] || return 1
   f="$CLAUDE_SESSIONS_DIR/$pid.json"
@@ -418,11 +479,46 @@ bridge_url_of() {
      && ! grep -q "\"sessionId\"[[:space:]]*:[[:space:]]*\"$tracked\"" "$f"; then
     return 1
   fi
+  echo "$f"
+}
+
+bridge_url_of() {
+  local name="$1" f bridge
+  f=$(session_json_of "$name") || return 1
 
   bridge=$(grep -o '"bridgeSessionId"[[:space:]]*:[[:space:]]*"session_[A-Za-z0-9_-]*"' "$f" \
     | sed 's/.*"\(session_[A-Za-z0-9_-]*\)".*/\1/')
   [ -n "$bridge" ] || return 1
   echo "https://claude.ai/code/$bridge"
+}
+
+# What claude itself says the session is doing, as "<status> <seconds it has
+# been in that status>". Fails when there is no usable session file, which
+# is the signal to fall back to the wall-clock timer rather than to guess.
+#
+# Statuses seen on Claude Code 2.1.202, all three verified live:
+#   busy    — mid-turn, working
+#   idle    — sitting at an empty prompt
+#   waiting — parked on a confirmation dialog, i.e. the one and only state
+#             the unattended Enter exists to clear
+#
+# This is what "unattended" has to mean here. Remote Control is not a tmux
+# client, so a session someone is driving from claude.ai has no attached
+# client and looks abandoned to tmux. `updatedAt` is no help either — it
+# tracks status *transitions*, so a session that has been busy for twenty
+# minutes still carries a twenty-minute-old timestamp (observed live) and
+# would read as abandoned.
+session_status_of() {
+  local name="$1" f st ms now
+  f=$(session_json_of "$name") || return 1
+  st=$(grep -o '"status"[[:space:]]*:[[:space:]]*"[a-z_]*"' "$f" \
+    | sed 's/.*"\([a-z_]*\)"$/\1/')
+  [ -n "$st" ] || return 1
+  ms=$(grep -o '"statusUpdatedAt"[[:space:]]*:[[:space:]]*[0-9][0-9]*' "$f" | grep -o '[0-9][0-9]*$')
+  [ -n "$ms" ] || ms=$(grep -o '"updatedAt"[[:space:]]*:[[:space:]]*[0-9][0-9]*' "$f" | grep -o '[0-9][0-9]*$')
+  [ -n "$ms" ] || return 1
+  now=$(date +%s)
+  echo "$st $(( now - ms / 1000 ))"
 }
 
 store_remote_url() {
@@ -528,8 +624,32 @@ supervise_loop() {
       local now
       now=$(date +%s)
       if [ "$UNATTENDED_NUDGE_SEC" -gt 0 ] && [ $(( now - last_nudge )) -ge "$UNATTENDED_NUDGE_SEC" ]; then
-        nudge_enter "$name"
-        last_nudge=$now
+        local sstate sstatus sage
+        if sstate=$(session_status_of "$name"); then
+          sstatus="${sstate%% *}"; sage="${sstate##* }"
+          if [ "$sstatus" != "waiting" ]; then
+            # Working, or sitting at an empty prompt. There is no dialog to
+            # clear, and a session someone is driving over Remote Control
+            # looks exactly like this — typing into it would put a stray
+            # Enter in their conversation.
+            last_nudge=$now
+          elif [ "$sage" -lt "$UNATTENDED_NUDGE_SEC" ]; then
+            # A dialog is up but it has only just appeared: give whoever
+            # opened it the chance to answer it themselves. Count from when
+            # it appeared, so the nudge lands exactly one interval later.
+            last_nudge=$(( now - sage ))
+          else
+            log "'$name' has been waiting on a confirmation for ${sage}s with nobody attached"
+            nudge_enter "$name"
+            last_nudge=$now
+          fi
+        else
+          # No usable session file (a Claude Code that writes none, or one
+          # that cannot be trusted to be this instance's): fall back to the
+          # v0.2.0 behaviour of nudging on the wall clock alone.
+          nudge_enter "$name"
+          last_nudge=$now
+        fi
       fi
       if [ "$REMOTE_CONTROL_REFRESH_SEC" -gt 0 ] && [ $(( now - last_refresh )) -ge "$REMOTE_CONTROL_REFRESH_SEC" ]; then
         refresh_remote_control "$name"
@@ -584,9 +704,11 @@ CHECK_INTERVAL_SEC="5"
 # space-separated apt package names auto-installed if missing
 REQUIRED_APT_PKGS="tmux uuid-runtime"
 
-# when nobody is attached (no tmux client) this many seconds, send a bare
-# Enter to clear a confirmation prompt auto mode may have fallen back to.
-# 0 disables.
+# when no tmux client is attached and claude has been parked on a
+# confirmation dialog for this many seconds, send a bare Enter to clear it.
+# A session that is working, or waiting at an empty prompt, is never typed
+# into — including one being driven from claude.ai, which no tmux client
+# can show. 0 disables.
 UNATTENDED_NUDGE_SEC="300"
 
 # how often to check that Remote Control is still connected and reconnect it
@@ -598,13 +720,24 @@ REMOTE_CONTROL_REFRESH_SEC="1200"
 
 # where Claude Code writes its per-session JSON files, one per running
 # session, named after that session's PID. Read-only; it is what makes the
-# connected/disconnected check above possible. Override only if Claude Code
-# is configured with a non-default CLAUDE_CONFIG_DIR.
+# connected/disconnected check above possible, and what tells the nudge
+# whether anyone is actually working in the session. Override only if Claude
+# Code is configured with a non-default CLAUDE_CONFIG_DIR.
 CLAUDE_SESSIONS_DIR="${CLAUDE_CONFIG_DIR:-${HOME:-/root}/.claude}/sessions"
+
+# where Claude Code keeps conversation transcripts. Read-only; used to check
+# that a conversation still exists before trying to resume it.
+CLAUDE_PROJECTS_DIR="${CLAUDE_CONFIG_DIR:-${HOME:-/root}/.claude}/projects"
+
+# 1: after a reboot (or any restart that took the tmux session with it),
+# bring the instance back on the conversation it had before, instead of an
+# empty one. 0: always start a new conversation.
+RESUME_AFTER_RESTART="1"
 
 # `new` refuses once this many instances already exist — each concurrent
 # instance is a separate claude process and a separate token cost.
-MAX_SESSIONS="3"
+# 0 = no limit.
+MAX_SESSIONS="0"
 EOF
 
   # Resolve claude to an absolute path using *this installer's* environment
@@ -722,8 +855,8 @@ cmd_new() {
 
   local count
   count=$(instance_count)
-  if [ "$count" -ge "$MAX_SESSIONS" ]; then
-    die "already at MAX_SESSIONS=$MAX_SESSIONS (see $CONFIG_FILE). Each concurrent instance is a separate claude process/token cost — raise MAX_SESSIONS if you really want more, or archive/rm-archive an existing instance first ('$PROG_NAME list')."
+  if [ "$MAX_SESSIONS" -gt 0 ] && [ "$count" -ge "$MAX_SESSIONS" ]; then
+    die "already at MAX_SESSIONS=$MAX_SESSIONS (see $CONFIG_FILE). Each concurrent instance is a separate claude process/token cost — raise MAX_SESSIONS (0 = no limit) if you really want more, or archive/rm-archive an existing instance first ('$PROG_NAME list')."
   fi
 
   local new_workdir="$WORKDIR" new_args="$CLAUDE_ARGS" new_bin="$CLAUDE_BIN"
@@ -937,8 +1070,8 @@ cmd_resume() {
 
   local count
   count=$(instance_count)
-  [ "$count" -ge "$MAX_SESSIONS" ] \
-    && die "already at MAX_SESSIONS=$MAX_SESSIONS ($CONFIG_FILE)"
+  [ "$MAX_SESSIONS" -gt 0 ] && [ "$count" -ge "$MAX_SESSIONS" ] \
+    && die "already at MAX_SESSIONS=$MAX_SESSIONS, 0 = no limit ($CONFIG_FILE)"
 
   local args="" bin=""
   if [ -r "$archive_dir/instance.env" ]; then

@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-> 译自 `README.md`（v0.3.0）。如有冲突，以英文版为准。
+> 译自 `README.md`（v0.4.0）。如有冲突，以英文版为准。
 
 在 Debian 服务器上，以 root 身份常驻一个或多个命名的、可远程接管的 Claude Code（`claude`）会话，无论机器重启还是 `claude` 进程本身被杀（Ctrl+C、崩溃、`exit`）都能保证实例还在。
 
@@ -11,12 +11,16 @@
 - 安装一个 systemd **实例模板**，为每个命名实例监督一个专用的 `tmux` 会话，默认在其中运行 `claude --permission-mode auto --remote-control`——远程控制指的是可以直接在 **claude.ai 网页或手机上**接管任意一个实例，不只是走 SSH+tmux。
 - 掌握每个实例当前的 `claude.ai/code/...` 远程控制链接——`claude-guardian url <name>` 或 `claude-guardian list` 无需接管会话即可打印出来。这样做的意义在于：完全可以从另一台设备创建、发现、接入一个会话，不需要终端。用的时候现取，不要收藏成书签：远程控制每次重连，链接都会变。
 - `claude` 无论因何退出，都会在几秒内自动重新拉起，接着同一段对话继续——tmux 会话（连同其滚动记录）不受影响。
-- 整个监督进程或宿主机重启后，每一个曾经被 `activate` 过的实例都会自动回来。
-- 只要某个实例暂时无人接管，就会定期"敲一下"它，防止它悄悄卡死或变得不可达：发送 Enter 清除 `auto` 权限模式在多次被分类器拦截后可能回退出现的确认弹窗，并检查远程控制是否还连着——断了就重连，并取回新的链接。这项检查读的是 Claude Code 自己的会话文件，不会往会话里输入任何东西。这里涉及的权衡见 `DESIGN.md` → Known limitations。
+- 整个监督进程或宿主机重启后，每一个曾经被 `activate` 过的实例都会自动回来——而且是**接着重启前那段对话**，不是一个空会话。重启会把 tmux 服务器一起带走，所以会话是从零重建的；只要该实例的对话记录还在磁盘上，就会用 `claude --resume` 把对话接回来（设置 `RESUME_AFTER_RESTART=0` 可关闭）。如果某段对话已经无法恢复，就退回开一段新对话，而不是让实例卡在那里。
+- 只要没有人接管某个实例，就会盯着它，防止它悄悄卡死或变得不可达——判断依据是读取 Claude Code 自己的会话文件，所以一个健康的实例绝不会被输入任何东西：
+  - 如果它停在一个确认弹窗上超过 `UNATTENDED_NUDGE_SEC` 秒且没人来回应，就发送 Enter 把弹窗清掉。正在工作的会话、或者停在空提示符等待输入的会话，都不会被打扰——包括有人正在 claude.ai 上操作的会话，这类会话没有接入的 tmux 客户端，否则会被误判成无人照看。
+  - 检查远程控制是否还连着，断了就重连并取回新的链接。
+
+  这里涉及的权衡见 `DESIGN.md` → Known limitations。
 - 可以**暂停**一个实例（`deactivate`/`activate`：只停/恢复监督，tmux 会话继续跑），这与**归档**它（`archive`/`resume`：先保存滚动记录和对话 id，再杀掉进程；之后用 `claude --resume` 接回对话）是两件独立的事。
 - 前置检查：自动安装缺失的 `apt` 包（默认是 `tmux`、`uuid-runtime`），确认 `claude` 在 `PATH` 上。`install`/`new` 阶段如果 `claude` 还没登录（通过 `claude auth status` 检测）会直接拒绝继续；实例一旦跑起来，`run` 阶段对登录状态只警告不阻塞，这样实例后续如果丢失登录状态也会继续重试，而不是直接启动失败。
 - 提供 `attach` 命令，供远程操作者通过 SSH 接管某个存活的会话，作为 claude.ai 远程控制链接之外的另一条路径。
-- 限制成本/资源增长：一旦并发实例数达到 `MAX_SESSIONS`（默认 3），`new` 就会拒绝——每多一个实例就是一个独立的 `claude` 进程，也是一份独立的 token 花费。
+- 可选的成本/资源增长护栏：设置 `MAX_SESSIONS` 后，一旦已有实例数达到这个值，`new` 就会拒绝——每多一个实例就是一个独立的 `claude` 进程，也是一份独立的 token 花费。默认不限制（`0`）。
 
 非目标：不负责安装或更新 Claude Code CLI 本身，也不对外暴露网络控制接口——生命周期管理只走 CLI（详见 `DESIGN.md`）。
 
@@ -31,9 +35,9 @@
 ## 安装
 
 ```bash
-# 克隆一个 tag，不要克隆分支尖端——分支尖端可能处于改动中途。
-# 查看可用 tag：git ls-remote --tags <repo-url>
-git clone --depth 1 --branch v0.3.0 https://github.com/CharlesGool/claude-code-guardian.git
+# Clone a tag, not the branch tip — the tip can be mid-change.
+# List available tags: git ls-remote --tags <repo-url>
+git clone --depth 1 --branch v0.4.0 https://github.com/CharlesGool/claude-code-guardian.git
 cd claude-code-guardian
 bash bin/claude-guardian.sh install
 ```
@@ -51,8 +55,8 @@ claude-guardian attach
 
 ```bash
 claude-guardian new work --workdir /root/some-project
-claude-guardian list          # 列出每个实例：systemd/tmux 状态、是否有人接管、工作目录、远程控制链接
-claude-guardian url work      # 只打印 claude.ai 链接——不需要接管
+claude-guardian list          # every instance: systemd/tmux state, attached?, workdir, remote-control URL
+claude-guardian url work      # print just the claude.ai URL — no attach needed
 ```
 
 ## 验证是否生效
@@ -62,7 +66,7 @@ claude-guardian url work      # 只打印 claude.ai 链接——不需要接管
 - 在会话里真正退出 `claude`（快速按两次 Ctrl+C，或输入 `/exit`——单次 Ctrl+C 只会中断当前这一轮，不会退出）——几秒内 `claude-guardian logs` 会打印一行 `respawning automatically`，再次接管会看到 `claude` 又跑起来了，还是同一段对话。
 - `claude-guardian deactivate`——`claude` 继续跑（只是暂停监督并取消开机自启，见下面的坑）；`claude-guardian activate` 恢复监督，不会重启它。
 - `claude-guardian archive claude-code --yes`，再 `claude-guardian resume claude-code`——该实例从 `list` 里消失，出现在 `archives` 里，恢复后是同一段对话的延续（`claude --resume`）。
-- `reboot` 宿主机——重启后，每一个曾被 `activate` 过的实例都会自动变回 `active`，不需要手动干预。
+- `reboot` 宿主机——重启后，每一个曾被 `activate` 过的实例都会自动变回 `active`，不需要手动干预，而且 `claude-guardian logs <name>` 会打印一行 `continuing this instance's previous conversation`。接管进去看：重启前的那段对话还在。（不想重启机器也可以这样验证：`claude-guardian stop <name>`，用 `tmux -S /run/claude-guardian/tmux.sock kill-session -t <name>` 杀掉它的 tmux 会话，再 `claude-guardian start <name>`——效果一样。）
 
 ## 配置
 
@@ -76,10 +80,12 @@ claude-guardian url work      # 只打印 claude.ai 链接——不需要接管
 | `CLAUDE_ARGS` | 每次（重）启动时附带的额外 CLI 参数 | `--permission-mode auto --remote-control` | 全局 / 可按实例覆盖 |
 | `CHECK_INTERVAL_SEC` | 存活检查的间隔秒数 | `5` | 全局 |
 | `REQUIRED_APT_PKGS` | 缺失时自动安装的 apt 包，空格分隔 | `tmux uuid-runtime` | 全局 |
-| `UNATTENDED_NUDGE_SEC` | 仅无人值守时生效：空闲这么多秒后发送 Enter 清除卡住的确认弹窗（`0` 表示禁用） | `300` | 全局 |
+| `UNATTENDED_NUDGE_SEC` | 仅无人值守时生效：确认弹窗无人应答达到这么多秒后，发送一次 Enter（`0` 表示禁用）。正在工作或停在提示符等待输入的会话不会收到任何输入 | `300` | 全局 |
 | `REMOTE_CONTROL_REFRESH_SEC` | 仅无人值守时生效：每隔这么多秒检查一次远程控制是否还连着，断了就重连（`0` 表示禁用） | `1200` | 全局 |
-| `CLAUDE_SESSIONS_DIR` | Claude Code 写每个会话 JSON 文件的位置；只读，连接/断开检查读的就是这里 | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions` | 全局 |
-| `MAX_SESSIONS` | 实例数达到这个值后 `new`/`resume` 会拒绝 | `3` | 全局 |
+| `CLAUDE_SESSIONS_DIR` | Claude Code 写每个会话 JSON 文件的位置；只读，连接/断开以及忙碌/空闲/等待输入这些判断读的都是这里 | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions` | 全局 |
+| `CLAUDE_PROJECTS_DIR` | Claude Code 存放对话记录的位置；只读，重启后恢复对话前会先检查这里 | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects` | 全局 |
+| `RESUME_AFTER_RESTART` | `1`：重启后让实例接着之前那段对话回来。`0`：总是开一段新对话 | `1` | 全局 / 可按实例覆盖 |
+| `MAX_SESSIONS` | 已有实例数达到这个值后，`new`/`resume` 会拒绝；`0` = 不限制 | `0` | 全局 |
 
 把 `CLAUDE_ARGS` 里的 `--permission-mode auto` 去掉会改变 `DESIGN.md` → Known limitations 里描述的那个安全权衡——动手前先读那一节。
 
@@ -89,23 +95,23 @@ claude-guardian url work      # 只打印 claude.ai 链接——不需要接管
 
 ```bash
 claude-guardian new <name> [--workdir D] [--args "..."] [--claude-bin PATH]
-                            # 创建 + 启用 + 启动一个新实例
-claude-guardian list       # 列出所有实例的表格
-claude-guardian url <name> # 打印该实例当前的 claude.ai 远程控制链接
-claude-guardian activate <name>    # 启用 + 启动（重启后仍会自动拉起）
-claude-guardian deactivate <name>  # 禁用 + 只停止监督——tmux 会话继续留着
-claude-guardian archive <name> [--yes]   # 先取消激活，保存滚动记录 + 对话 id，再杀掉会话
-claude-guardian archives                 # 列出已归档的实例
-claude-guardian resume <archive-id> [name]  # 从某个归档重建实例，接着对话继续
-claude-guardian rm-archive <id> [--yes]  # 永久删除某个归档
+                            # create + enable + start a new instance
+claude-guardian list       # table of every instance
+claude-guardian url <name> # print the instance's current claude.ai remote-control URL
+claude-guardian activate <name>    # enable + start (survives reboot)
+claude-guardian deactivate <name>  # disable + stop supervision only — tmux session left running
+claude-guardian archive <name> [--yes]   # deactivate, save scrollback + conversation id, kill the session
+claude-guardian archives                 # list archived instances
+claude-guardian resume <archive-id> [name]  # recreate an instance from an archive, continue the conversation
+claude-guardian rm-archive <id> [--yes]  # permanently delete one archive
 
-claude-guardian check      # 只跑前置检查报告，不做任何改动
-claude-guardian status [name]  # systemctl status（name 默认是 'claude-code'）
-claude-guardian logs [name]    # 跟踪某个实例的 service 日志
-claude-guardian stop [name]    # 停止（临时性的——'deactivate' 还会额外取消开机自启）
-claude-guardian uninstall  # 移除 systemd 模板（每个实例的配置/会话保持不动）
-claude-guardian purge [--yes]  # 彻底清除：uninstall + 杀掉所有会话 + 删除配置/二进制
-                                # （归档不会被删除——见 rm-archive）
+claude-guardian check      # preflight report only, no changes
+claude-guardian status [name]  # systemctl status (name defaults to 'claude-code')
+claude-guardian logs [name]    # follow one instance's service journal
+claude-guardian stop [name]    # stop (temporary — 'deactivate' also disables at boot)
+claude-guardian uninstall  # remove the systemd template (every instance's config/session left untouched)
+claude-guardian purge [--yes]  # full teardown: uninstall + kill every session + remove config/binary
+                                # (archives are NOT deleted — see rm-archive)
 ```
 
 坑：在已接管的会话里，Ctrl+C 是被 `claude` 自己解释的（中断当前这一轮；连按两次会让它退出，然后按设计会被自动重新拉起——手动杀掉进程也保证还会剩下一个实例在跑）。无论哪种情况，这都不是一种干净的分离方式。请改用 tmux 前缀键 + `d`。
