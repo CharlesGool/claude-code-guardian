@@ -26,7 +26,7 @@ except at the bottom" is one.
 
 ## Items
 
-- [ ] 2026-08-21 leave an instance idle overnight and record whether v0.6.2 also goes unreachable — that result decides whether the withdrawn Remote Control work is recovered
+- [ ] 2026-08-21 start an instance and leave it idle overnight to record whether v0.6.2 also goes unreachable — begins with `claude-guardian new`, since every instance was archived on 2026-08-21 and nothing is running; the result is what decides whether the withdrawn Remote Control work is recovered
 - [ ] 2026-08-21 decide what to do with the withdrawn v0.7.0/v0.8.0 work once the overnight result is in — the deleted refs are in a bundle kept outside this repo (see ../.local-notes.md); the 2026-08-21 DECISIONS.md entry lists what was in it
 - [ ] 2026-08-21 give v0.6.2 a way to repair a session that is unreachable while the host looks healthy — there is none today, so the operator must attach and type `/remote-control` by hand; start from `capture_remote_control_url` in bin/claude-guardian.sh, and read the 2026-08-21 DECISIONS.md entry first because the withdrawn versions already tried two answers to this
 - [ ] 2026-08-21 migrate an existing /etc config so it picks up settings added after it was first written — `install` never rewrites it, so a host can silently fall back to built-in defaults and a shipped feature is present but inert; start from the config template heredoc in bin/claude-guardian.sh
