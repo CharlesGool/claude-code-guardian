@@ -8,6 +8,52 @@ already-rejected option gets recommended again two weeks later.
 
 ---
 
+## 2026-08-21 — withdraw v0.7.0 and v0.8.0; the code baseline returns to v0.6.2
+
+- **Context:** four supervised instances and, separately, a plain `claude`
+  the tool was not supervising all became unreachable from claude.ai
+  ("Can't reach your computer") after sitting idle. The supervisor log was
+  clean across an eleven-hour window before the first recorded drop, which
+  is the failure mode this project has been chasing since v0.6.0.
+- **Decision:** the maintainer judged the v0.7.0 Remote Control rework to be
+  the cause and withdrew it. The installed binary was rolled back to v0.6.2;
+  the `v0.7.0` and `v0.8.0` tags were deleted locally and on the remote, the
+  `v0.7.0` Release object was deleted, both snapshot directories were
+  removed, and `main` was force-reset to `v0.6.2`. All later work starts
+  from the v0.6.2 baseline.
+- **Why (the maintainer's judgement):** the drops began after v0.7.0 shipped
+  and were not observed on v0.6.2.
+- **Evidence recorded against that judgement, so it is not re-argued from
+  memory:** (1) the same drop hit a plain `claude` running outside tmux at a
+  moment when zero supervised instances existed, and no version of this tool
+  can cause a drop in a process it is not supervising; (2) v0.7.0's own
+  changelog listed "an instance could sit unreachable indefinitely behind a
+  clean log" as a defect it *fixed* — that was v0.6.2 behaviour, so the
+  rollback restores it; (3) the real v0.7.0 regression was dropping
+  `--permission-mode auto` from `CLAUDE_ARGS`, which crash-loops a root
+  instance whose settings request `bypassPermissions`, and v0.8.0 had
+  already fixed exactly that. This decision was taken with those three
+  points on the table.
+- **What the withdrawal costs:** the `reconnect` command, the isolated
+  23-case Remote Control suite, `REMOTE_CONTROL_MAX_BRIDGE_AGE_SEC` (the
+  only automatic recovery from a bridge that dies silently upstream), and
+  `BACKLOG.md`. Until something replaces them the only remedy for an
+  unreachable session is to attach and type `/remote-control` by hand.
+- **Also learned, and it outlives this decision:** a bridge id survives a
+  restart. A killed instance brought back with `claude --resume` re-attaches
+  the *same* `bridgeSessionId`, so the claude.ai URL is unchanged (verified
+  on four instances). The id therefore cannot be read as proof that anything
+  is flowing, and an unchanged URL after a restart is not a symptom.
+- **Open, and the reason this entry exists:** the deciding experiment had
+  not been run when the deletion was made — leave an instance idle overnight
+  and see whether v0.6.2 drops too. If it does, the cause is the Remote
+  Control link rather than this tool, and the withdrawn work is worth
+  recovering; a full bundle of every deleted ref was taken beforehand and
+  its location is in the maintainer's local notes. If it does not drop, the
+  judgement above is confirmed and the v0.7.0 diff is where to look.
+
+---
+
 ## 2026-08-17 — watch the connection on every tick, and stop answering dialogs by default
 
 - **Context:** within an hour of v0.4.0 going live with three instances, the
