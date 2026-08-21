@@ -1,6 +1,6 @@
 ---
 project: claude-code-guardian
-version: v0.6.2
+version: v0.9.0
 status: active
 branch: main
 updated: 2026-08-21
@@ -11,8 +11,27 @@ updated: 2026-08-21
 **Notion:** private mirror (not published)
 **Repo:** https://github.com/CharlesGool/claude-code-guardian (public, GPL-3.0)
 **Snapshots:** maintained privately (not published)
-**Release:** https://github.com/CharlesGool/claude-code-guardian/releases/tag/v0.6.2
-**In progress:** v0.7.0 and v0.8.0 were withdrawn on 2026-08-21 — tags, the
+**Release:** https://github.com/CharlesGool/claude-code-guardian/releases/tag/v0.9.0
+**In progress:** v0.9.0 released. It makes the tool's founding promise — "at
+least one session is always available" — an enforced property instead of an
+emergent one. Until now it held only because `install` enabled the default
+instance and nobody had archived it; archiving or deactivating the last
+instance dropped the host to zero silently, and a reboot brought back
+nothing. Two mechanisms: `archive`/`deactivate` warn (and ask, unless
+`--yes`) when the instance being removed is the last one that would come up
+at boot, and a new `claude-guardian-floor.service` runs once per boot and
+recreates + starts the default instance when nothing else would
+(`ENSURE_DEFAULT_INSTANCE`, default `1`). Version skips v0.7.0/v0.8.0
+because both were published and withdrawn — see DECISIONS.md. Verified:
+shellcheck-clean; a 48-case isolated suite that fails 27 cases against the
+v0.6.2 baseline, so it can detect the absence of this work; and live on the
+maintainer's host with real systemd (floor unit brought a real instance back
+from zero, and was a no-op on the second run). Not verified live: an actual
+reboot, and the branch where the instance config file is missing entirely.
+An instance is running again as a result of that testing, which is what the
+overnight reachability check needs.
+
+Previously: v0.7.0 and v0.8.0 were withdrawn on 2026-08-21 — tags, the
 v0.7.0 Release and both snapshots deleted, `main` force-reset here — after
 supervised instances kept going unreachable from claude.ai. v0.6.2 is the
 baseline all later work starts from. Read DECISIONS.md (2026-08-21) before
@@ -23,10 +42,19 @@ withdrawal cost. v0.6.2 released. v0.6.1 tried to fix the reconnect-timer seedin
 Previously, in v0.5.0: ships `skills/claude-session/`, the Agent Skill that drives these commands from plain language.
 
 Previously, in v0.4.0: Clears both known issues left by v0.3.0 (see DECISIONS.md, 2026-08-17, the "resume the conversation across a reboot" and "nudge only a session that is actually parked" entries). An instance now comes back from a reboot on the conversation it already had, via `claude --resume` gated on the transcript still existing under `$CLAUDE_PROJECTS_DIR` (`RESUME_AFTER_RESTART=0` opts out), falling back to a new conversation — once, not in a loop — if `claude` rejects the resume. The unattended Enter is now gated on Claude Code's own `status` field: only a session reporting `waiting` (parked on a confirmation dialog) for a full `UNATTENDED_NUDGE_SEC` is typed into, so `busy`/`idle` sessions, including ones being driven from claude.ai, are left alone. `MAX_SESSIONS` now defaults to `0` = no limit. Verified three ways before tagging: shellcheck-clean; 38 isolated cases with a stub `claude` on a private tmux socket (transcript found/missing/wrong-workdir, resume vs fresh vs opted-out, a rejected resume falling back instead of looping, status parsing with PID and sessionId mismatches, and the nudge across `busy`/`idle`/fresh-dialog/stale-dialog/no-session-file); and live on the maintainer's host with the real binary on a throwaway third instance — a simulated reboot brought back the marker turn from before it (and, incidentally, the same claude.ai URL), and a real confirmation dialog left unanswered for 16s was cleared by the supervisor at the 15s mark it was configured with, with the two production instances untouched throughout.
-**Next:** 2026-08-21 start an instance and leave it idle overnight to record whether v0.6.2 also goes unreachable — begins with `claude-guardian new`, since every instance was archived on 2026-08-21 and nothing is running; the result is what decides whether the withdrawn Remote Control work is recovered
+**Next:** 2026-08-21 leave the running `claude-code` instance idle overnight and record whether it also goes unreachable — the instance is already up (the v0.9.0 boot floor started it during release testing), so this is `claude-guardian url claude-code` now and again in the morning; the result is what decides whether the withdrawn Remote Control work is recovered
 **Known issues:**
+- The boot floor is a `oneshot`: it runs at boot, not continuously. Archiving
+  the last instance mid-session still leaves the host with nothing running
+  until the next reboot or a manual `claude-guardian ensure-floor`. That is
+  the deliberate tradeoff (a continuous floor would make `archive`
+  unusable), and the new warning covers the interactive case.
+- With `ENSURE_DEFAULT_INSTANCE=1`, deactivating the *last* instance is
+  undone at the next boot, contradicting `deactivate`'s own "won't restart
+  at boot". Deliberate — the guarantee wins — and `deactivate` says so
+  before acting; a host meant to boot idle needs the setting at `0`.
 - A session can go unreachable from claude.ai while everything on this host
-  looks healthy, and v0.6.2 has no command that repairs it: attach and type
+  looks healthy, and there is still no command that repairs it: attach and type
   `/remote-control` by hand. Observed on supervised instances and on a plain
   `claude` this tool was not supervising, so the trigger is not known to be
   local. This is the open question above, not a settled defect.

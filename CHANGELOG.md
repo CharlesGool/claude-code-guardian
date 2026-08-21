@@ -4,6 +4,29 @@ Newest version first. Only changes a user can perceive — internal refactors do
 not need an entry. Draft from `git log <previous-tag>..HEAD --oneline`, then
 rewrite in user-facing terms.
 
+## v0.9.0 — 2026-08-21
+
+The tool's founding promise — "at least one session is always available" —
+was never actually enforced. It held only because `install` enabled the
+default instance and nobody had archived it since. Archive or deactivate
+your last instance and the host came back from a reboot with no
+conversation at all, without a word of warning. This release makes the
+promise real, from both ends.
+
+The version number skips `v0.7.0` and `v0.8.0`: both were published and
+then withdrawn on 2026-08-21 (see `DECISIONS.md`), and reusing a tag
+someone may already have fetched would hand them different code under the
+same name.
+
+### Added
+- **A boot floor.** A new `claude-guardian-floor.service` runs once per boot: if no instance would come up at all, it creates and starts the default `claude-code` one. A host that already has an enabled instance is never touched. Controlled by the new `ENSURE_DEFAULT_INSTANCE` setting, on by default — set it to `0` in `/etc/claude-guardian/config.env` if you would rather such a host boot with nothing. Note that `install` does not rewrite an existing config file, so after an upgrade the setting will not appear there and the built-in default applies until you add it yourself.
+- **`claude-guardian ensure-floor`**, the same check on demand — for repairing a host that was left with nothing running, without waiting for a reboot.
+- **`deactivate` accepts `--yes`**, matching `archive`.
+
+### Changed
+- **`archive` and `deactivate` warn when you are removing the last instance that would come up at boot**, and ask before doing it unless `--yes` is passed. The warning states what the next boot will actually do, which depends on `ENSURE_DEFAULT_INSTANCE`. Behaviour change for scripts: `deactivate <last-instance>` in a non-interactive shell now refuses instead of acting — pass `--yes`. Deactivating an already-disabled instance, or any instance that is not the last one, is unchanged and silent.
+- `uninstall` and `purge` also remove the boot-floor unit, so neither can leave behind a unit pointing at a binary it just deleted.
+
 ## v0.6.2 — 2026-08-17
 
 ### Fixed

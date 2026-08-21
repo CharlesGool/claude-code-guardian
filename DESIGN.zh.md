@@ -2,7 +2,7 @@
 
 [English](DESIGN.md) | **简体中文**
 
-> 译自 `DESIGN.md`（v0.6.2）。如有冲突，以英文版为准。
+> 译自 `DESIGN.md`（v0.9.0）。如有冲突，以英文版为准。
 
 > 本文档的成败标准：另一个人，在另一台机器上，能照着它把这个项目重建出来。写的时候假设读者看不到你的机器。
 
@@ -13,6 +13,7 @@
 - 让每个实例的远程控制链接都能在不接管它的情况下取到——创建时自动捕获，之后每次无人值守的刷新也会捕获，按实例存下来，由 `list`/`url` 打印。这样做的意义在于：操作者可以完全从另一个驱动这个工具 CLI 的 Claude Code 会话里创建、发现、接入一个会话，永远不需要自己的终端。
 - 让实例可以被**暂停**（`deactivate`/`activate`：停止/恢复监督，tmux 会话继续跑），这与被**归档**（`archive`/`resume`：保存滚动记录和对话 id，再杀掉进程；之后用 `claude --resume` 重建）是两件刻意区分开的、影响范围完全不同的操作。
 - 扛得住重启（每个被启用的实例的 service 都会开机自启）。
+- **保证下限，而不只是保证恢复。** 最初的需求（`DECISIONS.md`，2026-08-16）是「至少始终有一个会话可用」。在 v0.9.0 之前没有任何机制在执行它：它之所以成立，只是因为 `install` 启用了默认实例、而且从没有人把最后一个归档掉；一台最后一个实例被归档或停用的机器，开机后一段对话都不会有，而且悄无声息。现在有两套机制把它变成这个工具的性质——在计数降到零之前先警告，以及 `claude-guardian-floor.service`，它在开机时确实没有别的实例会起来时重建默认实例（`ENSURE_DEFAULT_INSTANCE=0` 可关闭）。
 - 扛得住 `claude` 进程本身被杀——Ctrl+C、崩溃、`exit`、OOM kill——在几秒内自动重启它，且不丢失周围的会话。
 - 在长时间无人值守的情况下依然保持真正可达，而不只是"进程还在跑"：在几秒内发现掉线的 Remote Control 连接并修复它，让一个实例不会出现「活着但够不着」超过一个 tick 的情况。清除 `auto` 权限模式回退出现的确认弹窗这件事也仍然提供，但默认关闭——回答一个弹窗是在做决定，而这个工具的职责到「保持会话可达」为止（见 Known limitations）。
 - 跑前置检查：确认所需的 `apt` 包已就位（缺失则自动安装）、`claude` 二进制已就位（硬性要求，永远不会自动安装）。登录状态通过 `claude auth status` 检测（这是权威判断，不是靠猜文件是否存在）——`install`/`new` 如果未登录会拒绝继续（一个从未登录过的实例只会白白重启一个没人能用的会话），而 `run` 只会警告，这样一个后来丢失登录状态的实例会继续重试，而不是直接拒绝启动。
@@ -64,6 +65,7 @@
 ```
 
 - **systemd 层**负责从以下情况恢复：重启、某个实例的监督脚本崩溃、该实例 tmux 服务端状态消失。`Restart=always` 加上有上限的 `StartLimitBurst`，防止 `claude` 真的缺失时无限重启（见 Known limitations）。`KillMode=process` 使得 `stop`/`restart`/`deactivate` 只信号给被跟踪的循环 PID，绝不波及 tmux 服务器或 `claude`（这一点是实测验证过的——systemd 默认的 `KillMode=control-group` 会把整个会话一起杀掉，所以这里必须显式设置，不能留给系统默认值）。因为它是一个*模板* unit（`claude-guardian@.service`），每个实例都是一个独立的 systemd unit 实例（`claude-guardian@work.service`、`claude-guardian@personal.service`……），可以单独启动、停止、启用或禁用，互不影响。
+- **开机兜底层**负责从另外两层都管不了的情况恢复，因为那两层都是按实例来的：根本没有实例可供监督的情况。`claude-guardian-floor.service` 是一个独立的 `oneshot` unit，和实例一样 `WantedBy=multi-user.target`，每次开机运行一次 `claude-guardian ensure-floor`。它统计的是「真的会起来的实例数」——`$INSTANCES_DIR` 里有配置文件**并且** unit 处于 enabled，因为 `deactivate` 会把配置文件留下——如果这个数是零，就重建默认实例并启动它。已存在的 `claude-code` 配置会被复用而不是覆盖（那正是 `deactivate` 的情形，工作目录和参数是操作者自己的）；只有确实缺失时才按全局默认写一份。它用 `systemctl start --no-block` 启动实例，而不是 `enable --now`：这个 unit 跑在开机事务内部，在那里阻塞等待另一个 unit 的启动作业正是开机死锁的成因。
 - **tmux 层**负责从以下情况恢复：`claude` 进程本身因任何原因退出，而*会话*（其滚动记录、其 pty）被保留下来。这正是为什么在会话里发 Ctrl+C 是安全的、不会丢状态——只有 `claude` 退出并被重新拉起，tmux 会话本身始终存活。（注：经对真实二进制验证，Claude Code 把单次 Ctrl+C 视为"中断当前这一轮"，而不是退出——要连按两次，或者输入 `/exit`，才会真正终止进程。）所有实例共用一个 tmux 服务器（一个 `$TMUX_SOCKET`），每个实例一个以实例名命名的会话——tmux 原生就支持多会话复用，所以每个实例单独起一个服务器只会增加运维负担而没有任何好处（见 `DECISIONS.md`，2026-08-17）。
 - **会话身份**：创建时，每个实例要么拿到一个全新的 `claude --session-id <uuid>`（通过 `uuidgen` 生成），要么拿到一个指向已有对话的 `claude --resume <uuid>`。无论哪种情况，这个 id 都会被固化进 tmux pane 的原始启动命令里，所以每次崩溃后的 `respawn-pane` 都会自动复用同一个 id——一次重生延续的是同一段对话，绝不会悄悄分叉出一段新的。这个 id 会记录在按实例区分的状态文件里（`/var/lib/claude-guardian/state/<name>.state`），这样 `archive` 能保存它、`resume` 能复用它，实例本身也能在重启之后找回同一段对话。
 - **在重启之后保住对话**：`respawn-pane` 只覆盖 `claude` 死掉、而它的 tmux 会话还活着的情况。一次重启会把整个 tmux 服务器一起带走，会话得从零重建——而在 v0.4.0 之前，这意味着每次开机都是一段崭新的空对话，之前那段虽然还留在磁盘上，却只能靠手工才能找回来。现在 `create_session` 会按以下顺序优先选择：一个显式的 `RESUME_SESSION_ID`（由 `resume <archive-id>` 设置）；实例自己状态里最近一次的 `claude_session_id`，前提是 `RESUME_AFTER_RESTART=1` 且它的 transcript 还在磁盘上；否则用 `uuidgen` 新生成一个 id。transcript 检查是让这套机制诚实的关键——它区分的正是"继续那段对话"和"把一个 `claude` 压根没听说过的 id 塞给它"。如果 `claude` 仍然拒绝这次恢复，它会立刻退出；与其让监督循环每隔 `CHECK_INTERVAL_SEC` 就把那条注定失败的命令重建一遍、永无止境，`create_session` 会在发现一次会话已死（或已消失）之后，改用一段新对话重试。
@@ -111,6 +113,7 @@
 | `/etc/claude-guardian/config.env` | 本工具，首次 `install` 时 | 全局运行时配置，由每个实例共享（见下文） |
 | `/etc/claude-guardian/instances/<name>.env` | 本工具，`new`/`resume` 时 | 按实例的覆盖项：`WORKDIR`、`CLAUDE_ARGS`、`CLAUDE_BIN`，以及（如果是恢复出来的）`RESUME_SESSION_ID` |
 | `/etc/systemd/system/claude-guardian@.service` | 本工具，`install` 时 | systemd **模板** unit——每个正在运行的实例对应一个 `claude-guardian@<name>.service` 实例 |
+| `/etc/systemd/system/claude-guardian-floor.service` | 本工具，`install` 时 | 开机兜底：一个 `oneshot` unit，每次开机执行一次 `claude-guardian ensure-floor`。刻意与模板分开——模板派生出的 unit 只存在于已经启用的实例，所以在「需要兜底的那个状态」下它们一个都不会运行 |
 | `/var/lib/claude-guardian/state/<name>.state` | 本工具，运行时 | 按实例的运行时状态：`claude_session_id`、`workdir`、`created_at`、`remote_url`、`remote_url_updated_at` |
 | `/var/lib/claude-guardian/archive/<name>-<timestamp>/` | 本工具，`archive` 时 | 每个被归档的实例一个目录：`scrollback.txt`、`meta.env`、`instance.env` |
 | `/usr/local/bin/claude-guardian` | 本工具，`install` 时（从 `bin/claude-guardian.sh` 拷贝） | 安装后的 CLI 入口 |
@@ -138,12 +141,13 @@
 | `CLAUDE_PROJECTS_DIR` | Claude Code 存放对话 transcript 的位置；只读，在重启之后恢复一段对话前会检查它 | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects` | 全局 | 否 |
 | `RESUME_AFTER_RESTART` | `1`：在一次把 tmux 会话一并带走的重启之后，让实例回到它原本那段对话上；`0`：总是开一段新的 | `1` | 全局，可按实例覆盖 | 否 |
 | `MAX_SESSIONS` | 实例数达到这个值后 `new`/`resume` 会拒绝；`0` = 不限制 | `0` | 全局 | 否 |
+| `ENSURE_DEFAULT_INSTANCE` | `1`：开机时如果没有任何实例会起来，就按上面的全局值创建并启动默认的 `claude-code` 实例；已经有启用中实例的机器一律不碰。`0`：这种机器开机后什么都不跑，恢复要靠手动 `new`。注意它与 `deactivate` 的相互作用：取 `1` 时，停用**最后一个**实例会在下次开机被推翻——这是刻意的（保证优先于账面状态），而 `deactivate` 会在动手前把这句话说出来 | `1` | 全局 | 否 |
 
 ## 从零搭建
 
 1. 以 root 身份，把仓库（克隆一个 tag，不是分支尖端）克隆到目标 Debian 服务器上——验证：`git clone ...` 退出码为 0，且 `bin/claude-guardian.sh` 存在。
 2. `bash bin/claude-guardian.sh check`——验证：打印出三个检查区块（`apt dependencies`、`claude CLI`、`login state`），带有 `[ok]`/`[missing]`/`[warn]` 标记，且不做任何改动。
-3. `bash bin/claude-guardian.sh install`——验证：以 `install complete` 结尾；`systemctl is-enabled claude-guardian@claude-code` 输出 `enabled`（默认实例已被自动创建并启用）。
+3. `bash bin/claude-guardian.sh install`——验证：以 `install complete` 结尾；`systemctl is-enabled claude-guardian@claude-code` 输出 `enabled`（默认实例已被自动创建并启用），且 `systemctl is-enabled claude-guardian-floor` 也输出 `enabled`（开机兜底）。
 4. `claude-guardian start`——验证：`systemctl is-active claude-guardian@claude-code` 输出 `active`。
 5. `claude-guardian attach`——验证：把你带进 tmux 里一个存活的 `claude` 终端（名字默认是 `claude-code`），且 pane 里会显示一行 `/remote-control is active ... https://claude.ai/code/session_...`——这个链接可以脱离这次 SSH 连接、独立地在网页或手机上控制，也可以完全不接管、直接用 `claude-guardian url claude-code` 打印出来。用 tmux 前缀键（默认 `Ctrl+b`）接 `d` 分离——**不要**用 Ctrl+C。
 6. `claude-guardian new second-instance`——验证：`claude-guardian list` 显示两行（`claude-code`、`second-instance`），各自带着自己的 `SYSTEMD`/`TMUX`/`URL` 列，确认两者被独立监督、都能远程控制。
@@ -153,7 +157,8 @@
 10. `claude-guardian resume second-instance`（或者用第 9 步得到的确切归档 id）——验证：`claude-guardian list` 再次显示 `second-instance`，且 `claude-guardian attach second-instance` 延续的是同一段对话，而不是从头开始。
 11. 在会话内部断开 Remote Control（`/remote-control` → `Disconnect this session`）然后分离——验证：在 `REMOTE_CONTROL_CHECK_SEC`（默认 5 秒）之内，`claude-guardian logs claude-code` 会出现 `remote control disconnected ... reconnecting`，紧跟着一个*新的*链接，并且 `claude-guardian url claude-code` 打印的就是这个新链接。之后让这个实例保持连接且无人接管数分钟——验证日志完全安静，也就是说每个 tick 都检查的代价在外部看不见、也不敲任何键。想验证重连退避：断开之后立刻让重连无法成功（比如把网络断掉），`reconnecting` 那一行最多每 `REMOTE_CONTROL_RECONNECT_BACKOFF_SEC` 出现一次，而不是每个 tick 一次。
 12. 在默认的 `UNATTENDED_NUDGE_SEC=0` 下：触发一个确认弹窗（用 `--permission-mode default` 最省事：让它执行任意一条 shell 命令），分离，放着不管数分钟——验证：`claude-guardian logs claude-code` 始终不会出现 `sending Enter` 那一行，你回来时弹窗还等在那里。没有任何东西替你回答它。然后把 `/etc/claude-guardian/config.env` 里的 `UNATTENDED_NUDGE_SEC` 设成 `"60"`，执行 `claude-guardian restart claude-code`，再重复一次——验证：到了 60 秒这个点，日志里出现 `has been waiting on a confirmation for Ns with nobody attached`，紧跟着 `sending Enter`，弹窗消失。再接管一次、再分离一次——验证它不会立即再次触发（计时器在接管时会重置）。验证完把它改回 `0`。
-13. `reboot` 宿主机——验证：重启后，每一个曾被 `activate`（而不是 `deactivate`）过的实例都会自动变回 `active`，不需要手动干预；`claude-guardian logs <name>` 会显示 `continuing this instance's previous conversation (<uuid>)`；接管进去看到的是重启之前那段对话，而不是一段空的。想不真的重启就演练一遍：`claude-guardian stop <name>`、`tmux -S /run/claude-guardian/tmux.sock kill-session -t <name>`、`claude-guardian start <name>`。
+13. 开机兜底。用 `claude-guardian deactivate <name> --yes` 逐个停用，直到没有实例处于启用状态——验证：最后一个会警告这台机器开机后将什么都不跑（不带 `--yes` 时，在非交互 shell 里会拒绝执行而不是照做）。然后 `systemctl start claude-guardian-floor`——验证：`journalctl -u claude-guardian-floor` 里出现 `no instance would come up at boot`，紧跟着 `instance 'claude-code' enabled and starting`，几秒内 `claude-guardian list` 显示 `claude-code` 为 `active`/`up`。再执行一次 `systemctl restart claude-guardian-floor`——验证它这次打印 `1 instance(s) already enabled — nothing to do`，并且没有多出第二个会话。把 `ENSURE_DEFAULT_INSTANCE` 设成 `"0"`，从空状态再来一遍——验证它打印 `disabled, doing nothing`，什么都不创建。
+14. `reboot` 宿主机——验证：重启后，每一个曾被 `activate`（而不是 `deactivate`）过的实例都会自动变回 `active`，不需要手动干预；`claude-guardian logs <name>` 会显示 `continuing this instance's previous conversation (<uuid>)`；接管进去看到的是重启之前那段对话，而不是一段空的。想不真的重启就演练一遍：`claude-guardian stop <name>`、`tmux -S /run/claude-guardian/tmux.sock kill-session -t <name>`、`claude-guardian start <name>`。
 
 本项目不是用 Docker 部署的；以上步骤就是完整的部署流程。
 
@@ -172,6 +177,9 @@ repo/
 
 ## 已知限制与坑
 
+- **开机兜底只在开机时运行，不是持续运行。** `ensure-floor` 是 `oneshot`，所以在会话进行中把最后一个实例归档掉，这台机器会一直什么都不跑，直到下次重启（或手动执行 `claude-guardian ensure-floor` / `new`）。这是刻意的：一个在你刚归档完几秒后就把实例重建出来的兜底会让 `archive` 无法使用；交互场景由同一版本加入的警告负责。要记住的推论是——「有兜底兜着」这句话只对重启成立。
+- **在 `ENSURE_DEFAULT_INSTANCE=1` 下，停用最后一个实例会在下次开机被推翻。** `deactivate` 承诺的是「开机不会再起来」，兜底承诺的是「总有东西在跑」；当这个实例是唯一一个时，两条承诺互相矛盾，兜底赢。`deactivate` 会在动手前把这一点原样打印出来，所以意外被提前到当场，而不是等到重启之后才发现——但一台真的希望开机空转的机器需要的是 `ENSURE_DEFAULT_INSTANCE=0`，不是 `deactivate`。
+- **兜底建出来的是一段新对话，不是你归档掉的那一段。** 当 `claude-code` 的配置不存在时，它按全局的 `WORKDIR`/`CLAUDE_ARGS` 写一份，新会话是空的。接回之前那段对话是 `resume <archive-id>` 的职责；兜底只保证*有*一个会话存在。
 - **`UNATTENDED_NUDGE_SEC`（自动敲 Enter）是一个刻意的、经过明确批准的安全权衡，不是一个中性的便利功能。** `--permission-mode auto` 在分类器连续拦截 3 次（或累计拦截 20 次）之后会回退到交互式确认——这个回退机制存在的意义就是让人来对分类器无法自动清除的动作做出判断。无人值守时发送一个裸 Enter，会接受当前高亮/默认的那个选项，**却并不知道那个默认选项对那个具体的弹窗来说是不是安全的选择。** 这一点是被 Claude Code 自己的 auto 模式分类器实测拦截过的——guardian 尝试以这个行为重启时被拦下（"defeats the human-in-the-loop safety fallback"），部署前需要用户明确确认（见 `DECISIONS.md`，2026-08-16）。如果这个权衡对某次部署来说不可接受，把 `UNATTENDED_NUDGE_SEC="0"` 设为禁用——文档里给出的替代方案是 `--permission-mode dontAsk` 配合一份明确的 `permissions.allow` 列表，未列出的动作会被静默拒绝，而不是靠猜一个确认弹窗（更可预测，但配置工作量更大）。v0.4.0 收窄的只是*这件事可能落到谁头上*：现在这个 Enter 只会发给一个 `claude` 自己报告为 `waiting` 的会话，而且还要等弹窗无人回答满整个间隔。所以一个有人正在里面工作的会话不会再被敲键。残留的情况是：一个人在 claude.ai 上打开了一个弹窗，然后把它晾了超过 `UNATTENDED_NUDGE_SEC`，但其实还打算回来回答它——从外面看，这和一个被遗弃的会话没有区别，于是这个弹窗会被代为回答。如果这一点对你很重要，把间隔调大。
 - **`claude-guardian install`/`new` 会非交互式地自动安装缺失的 apt 包**（`DEBIAN_FRONTEND=noninteractive apt-get install -y`）。默认情况下是 `tmux` 和 `uuid-runtime`。如果你扩大了 `REQUIRED_APT_PKGS`，请自行审查你在无人值守的情况下要求它安装的是什么。
 - **`claude` 二进制缺失会让某个实例的 service 失败循环大约一分钟，然后停下。** `preflight_enforce` 在找不到 `claude` 时会硬性失败（这是设计如此——本工具从不负责安装它）。unit 里的 `StartLimitBurst=10` / `StartLimitIntervalSec=60` 会阻止 systemd 无限重启；之后该实例会停在 `failed` 状态，直到你装好 `claude` 并执行 `systemctl reset-failed claude-guardian@<name> && claude-guardian start <name>`。

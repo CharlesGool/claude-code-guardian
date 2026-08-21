@@ -13,6 +13,7 @@ Keeps one or more named, remotely-attachable Claude Code (`claude`) sessions ali
 - **Keeps every instance continuously reachable.** Remote Control drops on its own — a server-side timeout, a network blip — and nothing announces it: the session keeps working, it just stops being reachable from claude.ai. Every supervision tick (`REMOTE_CONTROL_CHECK_SEC`, default 5s) the supervisor reads Claude Code's own session file to see whether the connection is still up, and reconnects the moment it isn't, picking up the new URL. The check types nothing into the session; only an actual reconnect does, and that is rate-limited by `REMOTE_CONTROL_RECONNECT_BACKOFF_SEC` (default 60s) so an instance that cannot reconnect is never typed into on a loop.
 - **Never answers a confirmation dialog for you, by default.** A session parked on a permission prompt can be unstuck by sending Enter — but Enter accepts whatever the dialog has highlighted, which means deciding on your behalf, and from outside there is no way to tell "abandoned" from "you simply haven't answered it yet". So `UNATTENDED_NUDGE_SEC` defaults to `0` (off) since v0.6.0. Set it to a number of seconds if you would rather have an unattended instance unstick itself; it then only ever types into a session Claude Code itself reports as parked on a dialog, never one that is working or idle. See `DESIGN.md` → Known limitations.
 - Lets you **pause** an instance (`deactivate`/`activate`: stop/resume supervision, tmux session left running) independently of **archiving** it (`archive`/`resume`: save scrollback + conversation id, then kill the process; pick the conversation back up later with `claude --resume`).
+- **Never boots with nothing running.** Archiving or deactivating instances can leave zero of them enabled, and until v0.9.0 a host in that state came back from a reboot with no conversation at all — silently. Two things now prevent it: `archive` and `deactivate` warn (and ask, unless `--yes`) when the instance being removed is the last one that would come up at boot, and a boot-time unit (`claude-guardian-floor.service`) creates and starts the default `claude-code` instance when nothing else would. Set `ENSURE_DEFAULT_INSTANCE=0` if you would rather a host with no enabled instance boot with nothing.
 - Runs preflight checks: auto-installs missing `apt` packages (`tmux`, `uuid-runtime` by default), verifies `claude` is on `PATH`. `install`/`new` refuse to proceed if `claude` isn't logged in yet (checked via `claude auth status`); once running, `run` only warns on login state so an instance that later loses auth keeps retrying instead of failing to start.
 - Ships an `attach` command for remote operators to take over a live session over SSH, as an alternative to the claude.ai remote-control URL.
 - Optional guardrail on cost/resource growth: set `MAX_SESSIONS` and `new` refuses once that many instances already exist — each is a separate `claude` process and a separate token cost. Unlimited by default (`0`).
@@ -32,12 +33,14 @@ Non-goals: it does not install or update the Claude Code CLI itself, and it does
 ```bash
 # Clone a tag, not the branch tip — the tip can be mid-change.
 # List available tags: git ls-remote --tags <repo-url>
-git clone --depth 1 --branch v0.6.2 https://github.com/CharlesGool/claude-code-guardian.git
+git clone --depth 1 --branch v0.9.0 https://github.com/CharlesGool/claude-code-guardian.git
 cd claude-code-guardian
 bash bin/claude-guardian.sh install
 ```
 
-`install` runs the preflight checks, writes a default global config to `/etc/claude-guardian/config.env`, installs the script to `/usr/local/bin/claude-guardian`, writes the systemd **instance template** (`claude-guardian@.service`), and creates + enables one default instance named `claude-code`. It does not start it — that's the next step. Upgrading from a v0.1.0 install migrates its single session onto the new template automatically, without killing the live `claude` process.
+`install` runs the preflight checks, writes a default global config to `/etc/claude-guardian/config.env`, installs the script to `/usr/local/bin/claude-guardian`, writes the systemd **instance template** (`claude-guardian@.service`) and the **boot-floor unit** (`claude-guardian-floor.service`), and creates + enables one default instance named `claude-code`. It does not start it — that's the next step. Upgrading from a v0.1.0 install migrates its single session onto the new template automatically, without killing the live `claude` process.
+
+Upgrading from any earlier version: re-run `bash bin/claude-guardian.sh install`. It is idempotent and leaves an existing `config.env` untouched, so the new `ENSURE_DEFAULT_INSTANCE` setting will not appear in your config file — the built-in default (`1`, floor on) applies until you add it yourself. Live instances are not restarted by `install`.
 
 ### Optional: the `claude-session` skill
 
@@ -69,7 +72,8 @@ claude-guardian url work      # print just the claude.ai URL — no attach neede
 - `systemctl is-active claude-guardian@claude-code` prints `active`.
 - `claude-guardian attach` drops you into a live `claude` terminal. Detach with the tmux prefix (default `Ctrl+b`) then `d` — **not** Ctrl+C (see gotcha below).
 - Actually exit `claude` from inside the session (press Ctrl+C **twice** in quick succession, or type `/exit` — a single Ctrl+C only interrupts the current turn, it does not exit) — within a few seconds `claude-guardian logs` shows a `respawning automatically` line, and attaching again shows `claude` running once more, same conversation.
-- `claude-guardian deactivate` — `claude` keeps running (only pauses supervision and disables restart-on-boot, see gotcha below); `claude-guardian activate` resumes watching it without restarting it.
+- `claude-guardian deactivate` — `claude` keeps running (only pauses supervision and disables restart-on-boot, see gotcha below); `claude-guardian activate` resumes watching it without restarting it. If it is your only instance, it now warns that the host would boot with nothing and asks first; pass `--yes` to skip the question.
+- The boot floor: with every instance deactivated or archived, `systemctl start claude-guardian-floor` logs `no instance would come up at boot` and brings `claude-code` back — `claude-guardian list` shows it `active`/`up` within a few seconds. Run it again and it logs `already enabled — nothing to do` without creating a second session. This is the same unit that runs at boot.
 - `claude-guardian archive claude-code --yes` then `claude-guardian resume claude-code` — the instance disappears from `list`, shows up in `archives`, and comes back with the same conversation continued (`claude --resume`).
 - Disconnect Remote Control from inside a session (`/remote-control` → `Disconnect this session`) and detach — within `REMOTE_CONTROL_CHECK_SEC` (5s by default) `claude-guardian logs <name>` shows `remote control disconnected ... reconnecting` followed by a URL, and `claude-guardian url <name>` prints that new URL. While the connection is healthy the log stays silent, which is the point: nothing is typed into a session that does not need it.
 - `reboot` the host — after boot, every instance that was `activate`d is `active` again without manual intervention, and `claude-guardian logs <name>` shows a `continuing this instance's previous conversation` line. Attach: the conversation from before the reboot is still there. (Without a reboot: `claude-guardian stop <name>`, kill its tmux session with `tmux -S /run/claude-guardian/tmux.sock kill-session -t <name>`, then `claude-guardian start <name>` — same result.)
@@ -93,6 +97,7 @@ Global defaults live in `/etc/claude-guardian/config.env`. Per-instance override
 | `CLAUDE_PROJECTS_DIR` | where Claude Code keeps conversation transcripts; read-only, checked before resuming a conversation after a restart | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects` | global |
 | `RESUME_AFTER_RESTART` | `1`: bring an instance back on its previous conversation after a reboot. `0`: always start a new one | `1` | global / per-instance |
 | `MAX_SESSIONS` | `new`/`resume` refuse once this many instances already exist; `0` = no limit | `0` | global |
+| `ENSURE_DEFAULT_INSTANCE` | `1`: at boot, if no instance would come up at all, create and start the default `claude-code` one. Never touches a host that already has an enabled instance. `0`: such a host boots with nothing | `1` | global |
 
 Editing `CLAUDE_ARGS` to remove `--permission-mode auto` changes the safety tradeoff described in `DESIGN.md` → Known limitations — read that first.
 
@@ -106,12 +111,17 @@ claude-guardian new <name> [--workdir D] [--args "..."] [--claude-bin PATH]
 claude-guardian list       # table of every instance
 claude-guardian url <name> # print the instance's current claude.ai remote-control URL
 claude-guardian activate <name>    # enable + start (survives reboot)
-claude-guardian deactivate <name>  # disable + stop supervision only — tmux session left running
+claude-guardian deactivate <name> [--yes]  # disable + stop supervision only — tmux session left running
+                                           # asks first if it is the last instance that would boot
 claude-guardian archive <name> [--yes]   # deactivate, save scrollback + conversation id, kill the session
+                                         # same last-instance warning as deactivate
 claude-guardian archives                 # list archived instances
 claude-guardian resume <archive-id> [name]  # recreate an instance from an archive, continue the conversation
 claude-guardian rm-archive <id> [--yes]  # permanently delete one archive
 
+claude-guardian ensure-floor   # the boot floor, on demand: if no instance would come up at
+                               # boot, create + enable + start the default one. Run automatically
+                               # by claude-guardian-floor.service; safe to run by hand
 claude-guardian check      # preflight report only, no changes
 claude-guardian status [name]  # systemctl status (name defaults to 'claude-code')
 claude-guardian logs [name]    # follow one instance's service journal

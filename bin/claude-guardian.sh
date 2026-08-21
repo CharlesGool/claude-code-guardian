@@ -33,9 +33,10 @@
 #                               attached?, workdir, remote-control URL
 #   url <name>                  print the stored claude.ai remote-control URL
 #   activate <name>             enable + start an instance (survives reboot)
-#   deactivate <name>           disable + stop supervision only; the live
+#   deactivate <name> [--yes]   disable + stop supervision only; the live
 #                               tmux session (if any) is left running,
-#                               still attachable
+#                               still attachable. Asks first if this is the
+#                               last instance that would come up at boot
 #   archive <name> [--yes]      deactivate, save scrollback + conversation
 #                               id, then kill the tmux session
 #   archives [prefix]           list archived instances
@@ -55,6 +56,11 @@
 #   check                       preflight checks only, report, no changes
 #   run <name>                  (internal) foreground supervision loop for
 #                               one instance; used as the unit's ExecStart
+#   ensure-floor                (internal) the boot floor: if no instance
+#                               would come up at boot, create and enable the
+#                               default one. Run at boot by
+#                               claude-guardian-floor.service; safe to run by
+#                               hand to repair a host left with nothing
 # ---- end of usage --------------------------------------------------------
 
 set -uo pipefail
@@ -66,6 +72,7 @@ STATE_DIR="/var/lib/claude-guardian/state"
 ARCHIVE_DIR="/var/lib/claude-guardian/archive"
 UNIT_TEMPLATE_PATH="/etc/systemd/system/claude-guardian@.service"
 LEGACY_UNIT_PATH="/etc/systemd/system/claude-guardian.service"
+FLOOR_UNIT_PATH="/etc/systemd/system/claude-guardian-floor.service"
 INSTALL_BIN="/usr/local/bin/claude-guardian"
 DEFAULT_INSTANCE="claude-code"
 
@@ -120,6 +127,13 @@ RESUME_AFTER_RESTART="1"
 # instance is a separate claude process and a separate token cost.
 # 0 = no limit.
 MAX_SESSIONS="0"
+# 1: at boot, if no instance would come up at all, create and enable the
+# default one ($DEFAULT_INSTANCE) from the values above. This is the floor
+# that makes "at least one session is always available" a property of the
+# tool rather than a side effect of nobody having archived the last instance
+# — see cmd_ensure_floor and DECISIONS.md (2026-08-21). 0: a host left with
+# no enabled instance boots with nothing running.
+ENSURE_DEFAULT_INSTANCE="1"
 
 if [ -r "$CONFIG_FILE" ]; then
   # shellcheck disable=SC1090
@@ -271,6 +285,44 @@ instance_file() { echo "$INSTANCES_DIR/$1.env"; }
 instance_exists() { [ -e "$(instance_file "$1")" ]; }
 instance_count() {
   find "$INSTANCES_DIR" -maxdepth 1 -name '*.env' 2>/dev/null | grep -c . || true
+}
+
+unit_is_enabled() {
+  [ "$(systemctl is-enabled "claude-guardian@${1}.service" 2>/dev/null)" = "enabled" ]
+}
+
+# How many instances would actually come up at the next boot. Not the same
+# as instance_count: `deactivate` leaves the config file in place but
+# disables the unit, so counting files alone overstates it, and it is this
+# number reaching zero — not the file count — that leaves a host booting
+# with no conversation at all.
+# $1 (optional): an instance to leave out of the count, i.e. "what would be
+# left if I archived/deactivated this one right now".
+boot_ready_count() {
+  local skip="${1:-}" f name n=0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    name=$(basename "$f" .env)
+    [ "$name" = "$skip" ] && continue
+    unit_is_enabled "$name" && n=$(( n + 1 ))
+  done < <(find "$INSTANCES_DIR" -maxdepth 1 -name '*.env' 2>/dev/null)
+  echo "$n"
+}
+
+# What the operator needs to be told when the action they just asked for
+# takes boot_ready_count to zero. Says what happens at the next boot, which
+# depends on whether the floor is on — silently dropping to zero is exactly
+# the failure this warning exists to stop.
+# $1 = instance name, $2 = lower-case gerund ("archiving"/"deactivating").
+last_instance_warning() {
+  local name="$1" verb="$2"
+  if [ "${ENSURE_DEFAULT_INSTANCE:-1}" = "1" ]; then
+    printf "'%s' is the last instance that would come up at boot, so %s it leaves this host with nothing running. ENSURE_DEFAULT_INSTANCE=1, so the next boot recreates and starts the default instance '%s' from the global config in %s — a fresh conversation with the global WORKDIR/CLAUDE_ARGS, not this instance's. Set ENSURE_DEFAULT_INSTANCE=0 there if you want this host to boot with nothing." \
+      "$name" "$verb" "$DEFAULT_INSTANCE" "$CONFIG_FILE"
+  else
+    printf "'%s' is the last instance that would come up at boot, so %s it leaves this host with nothing running. ENSURE_DEFAULT_INSTANCE=0, so a reboot will NOT bring anything back — you would have to run '%s new <name>' by hand. Set it to 1 in %s to have the default instance recreated at boot instead." \
+      "$name" "$verb" "$PROG_NAME" "$CONFIG_FILE"
+  fi
 }
 
 # Sources this instance's overrides (WORKDIR/CLAUDE_ARGS/CLAUDE_BIN, and
@@ -817,6 +869,14 @@ RESUME_AFTER_RESTART="1"
 # instance is a separate claude process and a separate token cost.
 # 0 = no limit.
 MAX_SESSIONS="0"
+
+# 1: at boot, if nothing at all would come up (every instance archived or
+# deactivated), create and start the default instance 'claude-code' from the
+# values above, so this host always boots with one reachable session. It
+# never touches a host that already has an enabled instance. 0: a host left
+# with no enabled instance boots with nothing running, and bringing one back
+# is a manual `claude-guardian new`.
+ENSURE_DEFAULT_INSTANCE="1"
 EOF
 
   # Resolve claude to an absolute path using *this installer's* environment
@@ -861,6 +921,33 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
   log "wrote systemd instance template to $UNIT_TEMPLATE_PATH"
+}
+
+# A second, non-templated unit whose only job is to run the boot floor once
+# per boot. Separate from the instance template on purpose: the template's
+# units only exist for instances that are already enabled, so none of them
+# runs in exactly the state the floor has to repair (zero enabled
+# instances). Type=oneshot with RemainAfterExit so it shows as active rather
+# than dead once it has made its decision.
+write_floor_unit() {
+  cat > "$FLOOR_UNIT_PATH" <<EOF
+[Unit]
+Description=Claude Code guardian boot floor (bring up a default instance if none would start)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$INSTALL_BIN ensure-floor
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  log "wrote systemd boot-floor unit to $FLOOR_UNIT_PATH"
 }
 
 # v0.1.0 shipped a single non-templated unit (claude-guardian.service,
@@ -911,15 +998,58 @@ cmd_install() {
   migrate_legacy_unit
 
   write_unit_template
+  write_floor_unit
   systemctl daemon-reload
 
   if ! instance_exists "$DEFAULT_INSTANCE"; then
     write_instance_file "$DEFAULT_INSTANCE" "$WORKDIR" "$CLAUDE_ARGS" "$CLAUDE_BIN"
   fi
   systemctl enable "claude-guardian@${DEFAULT_INSTANCE}.service"
+  systemctl enable claude-guardian-floor.service
 
   log "install complete. Start the default instance with: $PROG_NAME start"
   log "create additional concurrent instances with: $PROG_NAME new <name>"
+}
+
+# The boot floor. Until v0.9.0 "at least one session is always available"
+# — the requirement this tool was built for (DECISIONS.md, 2026-08-16) —
+# was never enforced anywhere: it held only because `install` enabled the
+# default instance and nobody had archived it since. `archive`,
+# `deactivate` and `uninstall` can each take the count of boot-enabled
+# instances to zero, and a host in that state comes back from a reboot with
+# no conversation at all, silently. This runs once per boot and repairs
+# exactly that state.
+cmd_ensure_floor() {
+  require_root
+  if [ "${ENSURE_DEFAULT_INSTANCE:-1}" != "1" ]; then
+    log "boot floor: ENSURE_DEFAULT_INSTANCE=${ENSURE_DEFAULT_INSTANCE:-1} — disabled, doing nothing"
+    return 0
+  fi
+
+  local n
+  n=$(boot_ready_count)
+  if [ "$n" -gt 0 ]; then
+    log "boot floor: $n instance(s) already enabled — nothing to do"
+    return 0
+  fi
+
+  log "boot floor: no instance would come up at boot — bringing up the default instance '$DEFAULT_INSTANCE'"
+  if instance_exists "$DEFAULT_INSTANCE"; then
+    # Left behind by `deactivate` (which keeps the config) rather than
+    # `archive` (which removes it). Reuse it: its workdir and args are the
+    # operator's, the global defaults are only a fallback.
+    log "boot floor: reusing the existing config at $(instance_file "$DEFAULT_INSTANCE")"
+  else
+    write_instance_file "$DEFAULT_INSTANCE" "$WORKDIR" "$CLAUDE_ARGS" "$CLAUDE_BIN"
+  fi
+
+  systemctl daemon-reload
+  systemctl enable "claude-guardian@${DEFAULT_INSTANCE}.service"
+  # --no-block, not `enable --now`: this unit runs inside the boot
+  # transaction, and waiting there for another unit's start job to finish is
+  # how a boot deadlocks. Queue it and return.
+  systemctl start --no-block "claude-guardian@${DEFAULT_INSTANCE}.service"
+  log "boot floor: instance '$DEFAULT_INSTANCE' enabled and starting — check it with '$PROG_NAME list'"
 }
 
 cmd_new() {
@@ -1033,9 +1163,33 @@ cmd_activate() {
 
 cmd_deactivate() {
   require_root
-  local name="${1:-$DEFAULT_INSTANCE}"
+  local name="" yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || name="$DEFAULT_INSTANCE"
+
+  # Only warn when this call actually changes the answer to "what comes up at
+  # boot": deactivating an already-disabled instance is a no-op, and a prompt
+  # there would just train the operator to type y.
+  local warn=""
+  if unit_is_enabled "$name" && [ "$(boot_ready_count "$name")" -eq 0 ]; then
+    warn=$(last_instance_warning "$name" "deactivating")
+    if [ "$yes" -ne 1 ]; then
+      confirm_or_die "WARNING: $warn
+
+Deactivate '$name' anyway?"
+    fi
+  fi
+
   systemctl disable --now "claude-guardian@${name}.service" 2>/dev/null \
     || log "warning: 'systemctl disable --now' reported an issue for '$name' (it may already be inactive)"
+  if [ -n "$warn" ]; then
+    log "warning: $warn"
+  fi
   log "instance '$name' deactivated — supervision stopped and won't restart at boot; its live tmux session (if any) was left running, still attachable with '$PROG_NAME attach $name'. Run '$PROG_NAME activate $name' to resume supervision."
 }
 
@@ -1051,8 +1205,22 @@ cmd_archive() {
   [ -n "$name" ] || die "usage: $PROG_NAME archive <name> [--yes]"
   instance_exists "$name" || die "no such instance '$name' ($PROG_NAME list)"
 
+  # Unlike deactivate, this warns whenever the *resulting* host state is
+  # "nothing would come up at boot", even if this instance was already
+  # disabled — archive is the destructive one, and it is the state the
+  # operator is left in that matters, not whether this call caused it.
+  local warn=""
+  [ "$(boot_ready_count "$name")" -eq 0 ] && warn=$(last_instance_warning "$name" "archiving")
+
+  local prompt="This stops instance '$name', saves its scrollback + conversation id, then KILLS the live tmux session. Continue?"
+  [ -n "$warn" ] && prompt="WARNING: $warn
+
+$prompt"
   if [ "$yes" -ne 1 ]; then
-    confirm_or_die "This stops instance '$name', saves its scrollback + conversation id, then KILLS the live tmux session. Continue?"
+    confirm_or_die "$prompt"
+  fi
+  if [ -n "$warn" ]; then
+    log "warning: $warn"
   fi
 
   systemctl disable --now "claude-guardian@${name}.service" 2>/dev/null || true
@@ -1194,9 +1362,13 @@ cmd_uninstall() {
     name=$(basename "$f" .env)
     systemctl disable --now "claude-guardian@${name}.service" 2>/dev/null || true
   done < <(find "$INSTANCES_DIR" -maxdepth 1 -name '*.env' 2>/dev/null)
-  rm -f "$UNIT_TEMPLATE_PATH"
+  # The boot floor goes with them: leaving it enabled would either fail at
+  # the next boot (its ExecStart is the binary this is removing) or, if the
+  # binary is still there, undo the uninstall by creating a fresh instance.
+  systemctl disable --now claude-guardian-floor.service 2>/dev/null || true
+  rm -f "$UNIT_TEMPLATE_PATH" "$FLOOR_UNIT_PATH"
   systemctl daemon-reload
-  log "systemd instance template removed; every instance disabled. Configs ($INSTANCES_DIR) and any running tmux sessions were left untouched."
+  log "systemd instance template and boot-floor unit removed; every instance disabled. Configs ($INSTANCES_DIR) and any running tmux sessions were left untouched."
   log "to also remove configs: rm -rf $(dirname "$CONFIG_FILE")"
   log "to also kill all live sessions: tmux -S $TMUX_SOCKET kill-server"
   log "or run '$PROG_NAME purge' to do all of the above (and remove the installed binary) in one step"
@@ -1223,10 +1395,11 @@ cmd_purge() {
     name=$(basename "$f" .env)
     systemctl disable --now "claude-guardian@${name}.service" 2>/dev/null || true
   done < <(find "$INSTANCES_DIR" -maxdepth 1 -name '*.env' 2>/dev/null)
-  rm -f "$UNIT_TEMPLATE_PATH" "$LEGACY_UNIT_PATH"
+  systemctl disable --now claude-guardian-floor.service 2>/dev/null || true
+  rm -f "$UNIT_TEMPLATE_PATH" "$LEGACY_UNIT_PATH" "$FLOOR_UNIT_PATH"
   systemctl daemon-reload
-  systemctl reset-failed 'claude-guardian@*' claude-guardian 2>/dev/null || true
-  log "every instance stopped and disabled; unit template removed"
+  systemctl reset-failed 'claude-guardian@*' claude-guardian claude-guardian-floor 2>/dev/null || true
+  log "every instance stopped and disabled; unit template and boot-floor unit removed"
 
   if command -v tmux >/dev/null 2>&1 && [ -S "$TMUX_SOCKET" ]; then
     tmux_cmd kill-server 2>/dev/null || true
@@ -1277,7 +1450,7 @@ main() {
     list)       cmd_list ;;
     url)        cmd_url "${1:-}" ;;
     activate)   cmd_activate "${1:-}" ;;
-    deactivate) cmd_deactivate "${1:-}" ;;
+    deactivate) cmd_deactivate "$@" ;;
     archive)    cmd_archive "$@" ;;
     archives)   cmd_archives "${1:-}" ;;
     resume)     cmd_resume "$@" ;;
@@ -1292,6 +1465,7 @@ main() {
     purge)      cmd_purge "$@" ;;
     check)      cmd_check ;;
     run)        cmd_run "$@" ;;
+    ensure-floor) cmd_ensure_floor ;;
     *)          usage; exit 1 ;;
   esac
 }

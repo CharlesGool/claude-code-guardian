@@ -8,6 +8,85 @@ already-rejected option gets recommended again two weeks later.
 
 ---
 
+## 2026-08-21 — enforce the "at least one session" floor, and default it to on
+
+- **Context:** the operator asked whether a host whose resident sessions had
+  all been closed would bring one back on reboot. It would not. The
+  2026-08-16 entry below records the founding requirement as "at least one
+  always available", and v0.1.0's changelog says the tool "keeps at least
+  one remotely-attachable Claude Code session alive" — but after v0.2.0
+  moved to multi-instance templating, nothing enforced it. It was emergent:
+  `install` enables the default instance, systemd starts whatever is
+  enabled, and no one had archived the last one. `archive` (disable +
+  delete the config) and `deactivate` (disable) both take the count to zero
+  with no check and no warning; the host that prompted this question was in
+  exactly that state after the v0.7.0/v0.8.0 withdrawal, and a reboot would
+  have produced nothing at all.
+- **Decision:** two mechanisms, deliberately separate.
+  (A) `archive`/`deactivate` warn — and ask, unless `--yes` — when the
+  instance being removed is the last one that would come up at boot.
+  (B) A `oneshot` unit, `claude-guardian-floor.service`, runs
+  `ensure-floor` once per boot and recreates + starts the default instance
+  when nothing else would. New setting `ENSURE_DEFAULT_INSTANCE`,
+  **default `1`**.
+- **Why default on:** the question that started this was "surely it should
+  bring one back?" — shipping it off by default would leave that
+  expectation unmet for everyone who does not read the config file. A tool
+  whose entire purpose is "a session is always reachable" should not make
+  the guarantee opt-in. The opt-out exists and is documented in three
+  places, which is the right way round.
+- **Counted on `is-enabled`, not on config files:** `deactivate` leaves the
+  config file behind, so counting `$INSTANCES_DIR/*.env` would report
+  instances that will never start. The floor asks the question that
+  matters — how many units would systemd actually bring up.
+- **Accepted consequence:** at `ENSURE_DEFAULT_INSTANCE=1`, deactivating the
+  *last* instance is undone at the next boot, which contradicts
+  `deactivate`'s own promise of "won't restart at boot". The guarantee wins,
+  and `deactivate` now says so out loud before it acts. A host genuinely
+  meant to boot idle sets `ENSURE_DEFAULT_INSTANCE=0`; that is not the same
+  operation as deactivating everything, and conflating the two is what
+  produced the silent-zero state in the first place.
+- **Rejected:**
+  - **Warning only (A without B)** — the operator's question was about what
+    happens on reboot, and a warning does nothing for a host already at
+    zero, which this one was.
+  - **A floor that runs continuously, on every supervision tick** — it would
+    re-create an instance seconds after a deliberate `archive`, making
+    `archive` unusable. Once per boot is the cadence that matches the
+    promise ("survives a reboot") without fighting the operator.
+  - **Folding the floor into the instance template unit** — the template's
+    units only exist for instances that are already enabled, so none of them
+    runs in the one state that needs repairing. It has to be its own unit.
+  - **`systemctl enable --now` inside the floor** — waiting on another
+    unit's start job from inside the boot transaction is a deadlock risk;
+    `enable` + `start --no-block` gets the same result without blocking.
+  - **Reusing the version number `v0.7.0`** — that tag and `v0.8.0` were
+    both pushed and then deleted. Anyone who fetched either would get
+    different code under the same name on a re-fetch, which is the reason
+    the release rules forbid moving a published tag. This ships as
+    `v0.9.0`; `v0.7.0` and `v0.8.0` stay burned.
+- **Verified:** shellcheck-clean; a 48-case isolated suite against a stub
+  `systemctl`/`claude` in a sandboxed path tree (floor at zero / at one / at
+  two / with every instance deactivated / opted out; the warning on archive
+  and on deactivate, present and absent, under both settings, in a non-tty
+  and under a pty; `--yes` handling; install/uninstall/purge unit wiring;
+  regressions on `list`/`archives`/usage). The same suite run against the
+  v0.6.2 baseline fails 27 of those 48, so it can actually detect the
+  absence of this work rather than merely agreeing with it — the lesson
+  from the v0.6.1 defect below. Then live on the maintainer's host with
+  real systemd: `install` wrote and enabled the floor unit; `deactivate` of
+  the only instance refused without `--yes` and warned with it; starting the
+  floor unit at zero brought the instance back (real `claude` process, tmux
+  session up, no boot deadlock); starting it again logged `already enabled
+  — nothing to do` and created no second session.
+- **Not verified live:** the branch where the instance config file is
+  missing entirely (the `archive` path) — the sandbox covers it, but on the
+  live host `archive` was blocked by a permission classifier and was not
+  worked around. Nor was an actual reboot; the floor unit was exercised by
+  starting it directly, which is the same code path systemd runs at boot.
+
+---
+
 ## 2026-08-21 — withdraw v0.7.0 and v0.8.0; the code baseline returns to v0.6.2
 
 - **Context:** four supervised instances and, separately, a plain `claude`

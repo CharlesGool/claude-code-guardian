@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-> 译自 `README.md`（v0.6.2）。如有冲突，以英文版为准。
+> 译自 `README.md`（v0.9.0）。如有冲突，以英文版为准。
 
 在 Debian 服务器上，以 root 身份常驻一个或多个命名的、可远程接管的 Claude Code（`claude`）会话，无论机器重启还是 `claude` 进程本身被杀（Ctrl+C、崩溃、`exit`）都能保证实例还在。
 
@@ -15,6 +15,7 @@
 - **让每个实例始终可达。** 远程控制会自己掉线——服务端超时、网络抖动——而且不会有任何提示：会话照常工作，只是从 claude.ai 上够不着了。现在每一个监督周期（`REMOTE_CONTROL_CHECK_SEC`，默认 5 秒）都会读一次 Claude Code 自己的会话文件来判断连接是否还在，一旦断开就立刻重连并取回新链接。这个检查不会往会话里输入任何东西；只有真正的重连动作才会，而它由 `REMOTE_CONTROL_RECONNECT_BACKOFF_SEC`（默认 60 秒）限速，所以一个始终连不回来的实例也不会被反复打字。
 - **默认不替你回答确认弹窗。** 停在权限确认弹窗上的会话可以靠发送 Enter 解开，但 Enter 接受的是弹窗当前高亮的那个选项，等于替你做决定；而从外面看，「会话被遗弃了」和「你只是还没回答」是分不清的。所以从 v0.6.0 起 `UNATTENDED_NUDGE_SEC` 默认为 `0`（关闭）。如果你更希望无人值守的实例能自己解开，把它设成一个秒数即可；开启后它也只会对 Claude Code 自报停在弹窗上的会话动手，正在工作或空闲的会话一律不碰。见 `DESIGN.md` → Known limitations。
 - 可以**暂停**一个实例（`deactivate`/`activate`：只停/恢复监督，tmux 会话继续跑），这与**归档**它（`archive`/`resume`：先保存滚动记录和对话 id，再杀掉进程；之后用 `claude --resume` 接回对话）是两件独立的事。
+- **绝不会出现「开机后一个都没有」。** 归档或停用实例，会让处于启用状态的实例数降到零；在 v0.9.0 之前，处于这个状态的机器重启后一段对话都不会有，而且全程没有任何提示。现在有两道防线：`archive` 和 `deactivate` 在你要移除的是「最后一个开机会起来的实例」时会警告，并且在没带 `--yes` 时先问一句；开机时还有一个专门的单元（`claude-guardian-floor.service`），在确实没有任何实例会启动时创建并拉起默认的 `claude-code` 实例。如果你更希望这种机器开机后什么都不跑，把 `ENSURE_DEFAULT_INSTANCE` 设成 `0`。
 - 前置检查：自动安装缺失的 `apt` 包（默认是 `tmux`、`uuid-runtime`），确认 `claude` 在 `PATH` 上。`install`/`new` 阶段如果 `claude` 还没登录（通过 `claude auth status` 检测）会直接拒绝继续；实例一旦跑起来，`run` 阶段对登录状态只警告不阻塞，这样实例后续如果丢失登录状态也会继续重试，而不是直接启动失败。
 - 提供 `attach` 命令，供远程操作者通过 SSH 接管某个存活的会话，作为 claude.ai 远程控制链接之外的另一条路径。
 - 可选的成本/资源增长护栏：设置 `MAX_SESSIONS` 后，一旦已有实例数达到这个值，`new` 就会拒绝——每多一个实例就是一个独立的 `claude` 进程，也是一份独立的 token 花费。默认不限制（`0`）。
@@ -34,12 +35,14 @@
 ```bash
 # Clone a tag, not the branch tip — the tip can be mid-change.
 # List available tags: git ls-remote --tags <repo-url>
-git clone --depth 1 --branch v0.6.2 https://github.com/CharlesGool/claude-code-guardian.git
+git clone --depth 1 --branch v0.9.0 https://github.com/CharlesGool/claude-code-guardian.git
 cd claude-code-guardian
 bash bin/claude-guardian.sh install
 ```
 
-`install` 会执行前置检查，把默认的全局配置写到 `/etc/claude-guardian/config.env`，把脚本安装到 `/usr/local/bin/claude-guardian`，写入 systemd **实例模板**（`claude-guardian@.service`），并创建、启用一个名为 `claude-code` 的默认实例。它不会启动这个实例——那是下一步。从 v0.1.0 升级时，会自动把原来的单一会话迁移到新模板上，且不会杀掉正在运行的 `claude` 进程。
+`install` 会执行前置检查，把默认的全局配置写到 `/etc/claude-guardian/config.env`，把脚本安装到 `/usr/local/bin/claude-guardian`，写入 systemd **实例模板**（`claude-guardian@.service`）和**开机兜底单元**（`claude-guardian-floor.service`），并创建、启用一个名为 `claude-code` 的默认实例。它不会启动这个实例——那是下一步。从 v0.1.0 升级时，会自动把原来的单一会话迁移到新模板上，且不会杀掉正在运行的 `claude` 进程。
+
+从任何旧版本升级：重新执行 `bash bin/claude-guardian.sh install` 即可。它是幂等的，并且不会覆盖已存在的 `config.env`——所以新增的 `ENSURE_DEFAULT_INSTANCE` 不会出现在你的配置文件里，在你自己加上之前一直沿用内置默认值（`1`，兜底开启）。`install` 也不会重启正在运行的实例。
 
 ### 可选：`claude-session` skill
 
@@ -71,7 +74,8 @@ claude-guardian url work      # print just the claude.ai URL — no attach neede
 - `systemctl is-active claude-guardian@claude-code` 输出 `active`。
 - `claude-guardian attach` 会把你带进一个存活的 `claude` 终端。用 tmux 前缀键（默认 `Ctrl+b`）接 `d` 来分离——**不要**用 Ctrl+C（见下面的坑）。
 - 在会话里真正退出 `claude`（快速按两次 Ctrl+C，或输入 `/exit`——单次 Ctrl+C 只会中断当前这一轮，不会退出）——几秒内 `claude-guardian logs` 会打印一行 `respawning automatically`，再次接管会看到 `claude` 又跑起来了，还是同一段对话。
-- `claude-guardian deactivate`——`claude` 继续跑（只是暂停监督并取消开机自启，见下面的坑）；`claude-guardian activate` 恢复监督，不会重启它。
+- `claude-guardian deactivate`——`claude` 继续跑（只是暂停监督并取消开机自启，见下面的坑）；`claude-guardian activate` 恢复监督，不会重启它。如果它是你唯一的实例，现在会先警告「这台机器开机后将什么都不跑」并要求确认；带 `--yes` 可跳过这一问。
+- 开机兜底：把所有实例都停用或归档之后，`systemctl start claude-guardian-floor` 会打印 `no instance would come up at boot` 并把 `claude-code` 拉回来——几秒内 `claude-guardian list` 里它就是 `active`/`up`。再跑一次则打印 `already enabled — nothing to do`，不会多开第二个会话。开机时运行的就是这个单元。
 - `claude-guardian archive claude-code --yes`，再 `claude-guardian resume claude-code`——该实例从 `list` 里消失，出现在 `archives` 里，恢复后是同一段对话的延续（`claude --resume`）。
 - 在会话内部断开远程控制（`/remote-control` → `Disconnect this session`）然后分离——在 `REMOTE_CONTROL_CHECK_SEC`（默认 5 秒）之内，`claude-guardian logs <name>` 会打印 `remote control disconnected ... reconnecting` 以及随后的新链接，`claude-guardian url <name>` 打印的也是这个新链接。连接健康时日志保持完全安静，这正是重点：不需要被打字的会话不会被打字。
 - `reboot` 宿主机——重启后，每一个曾被 `activate` 过的实例都会自动变回 `active`，不需要手动干预，而且 `claude-guardian logs <name>` 会打印一行 `continuing this instance's previous conversation`。接管进去看：重启前的那段对话还在。（不想重启机器也可以这样验证：`claude-guardian stop <name>`，用 `tmux -S /run/claude-guardian/tmux.sock kill-session -t <name>` 杀掉它的 tmux 会话，再 `claude-guardian start <name>`——效果一样。）
@@ -95,6 +99,7 @@ claude-guardian url work      # print just the claude.ai URL — no attach neede
 | `CLAUDE_PROJECTS_DIR` | Claude Code 存放对话记录的位置；只读，重启后恢复对话前会先检查这里 | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects` | 全局 |
 | `RESUME_AFTER_RESTART` | `1`：重启后让实例接着之前那段对话回来。`0`：总是开一段新对话 | `1` | 全局 / 可按实例覆盖 |
 | `MAX_SESSIONS` | 已有实例数达到这个值后，`new`/`resume` 会拒绝；`0` = 不限制 | `0` | 全局 |
+| `ENSURE_DEFAULT_INSTANCE` | `1`：开机时如果没有任何实例会启动，就创建并拉起默认的 `claude-code` 实例；已经有启用中实例的机器一律不碰。`0`：这种机器开机后什么都不跑 | `1` | 全局 |
 
 把 `CLAUDE_ARGS` 里的 `--permission-mode auto` 去掉会改变 `DESIGN.md` → Known limitations 里描述的那个安全权衡——动手前先读那一节。
 
@@ -108,12 +113,17 @@ claude-guardian new <name> [--workdir D] [--args "..."] [--claude-bin PATH]
 claude-guardian list       # table of every instance
 claude-guardian url <name> # print the instance's current claude.ai remote-control URL
 claude-guardian activate <name>    # enable + start (survives reboot)
-claude-guardian deactivate <name>  # disable + stop supervision only — tmux session left running
+claude-guardian deactivate <name> [--yes]  # disable + stop supervision only — tmux session left running
+                                           # asks first if it is the last instance that would boot
 claude-guardian archive <name> [--yes]   # deactivate, save scrollback + conversation id, kill the session
+                                         # same last-instance warning as deactivate
 claude-guardian archives                 # list archived instances
 claude-guardian resume <archive-id> [name]  # recreate an instance from an archive, continue the conversation
 claude-guardian rm-archive <id> [--yes]  # permanently delete one archive
 
+claude-guardian ensure-floor   # the boot floor, on demand: if no instance would come up at
+                               # boot, create + enable + start the default one. Run automatically
+                               # by claude-guardian-floor.service; safe to run by hand
 claude-guardian check      # preflight report only, no changes
 claude-guardian status [name]  # systemctl status (name defaults to 'claude-code')
 claude-guardian logs [name]    # follow one instance's service journal

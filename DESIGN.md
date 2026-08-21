@@ -27,6 +27,15 @@
   then kill the process; recreate later via `claude --resume`) — these are
   deliberately two different operations with two different blast radii.
 - Survive a reboot (each enabled instance's service starts at boot).
+- **Guarantee the floor, not just the recovery.** The original requirement
+  (`DECISIONS.md`, 2026-08-16) was "at least one session always
+  available". Until v0.9.0 nothing enforced it: it held only because
+  `install` enabled the default instance and nobody had archived it since,
+  and a host whose last instance was archived or deactivated booted with no
+  conversation at all, silently. Two mechanisms now make it a property of
+  the tool — a warning before the count reaches zero, and
+  `claude-guardian-floor.service`, which recreates the default instance at
+  boot when nothing else would (`ENSURE_DEFAULT_INSTANCE=0` opts out).
 - Survive the `claude` process itself being killed — Ctrl+C, crash, `exit`,
   OOM kill — by automatically restarting it within seconds, without losing
   the surrounding session.
@@ -123,6 +132,21 @@ one systemd unit instance and one tmux session per `claude-guardian
   `claude-guardian@personal.service`, ...) that can be individually
   started, stopped, enabled, or disabled without touching any other
   instance.
+- **boot-floor layer** recovers from something neither of the other two
+  can, because both of them are per-instance: the case where there is no
+  instance left to supervise. `claude-guardian-floor.service` is a separate
+  `oneshot` unit, `WantedBy=multi-user.target` like the instances
+  themselves, that runs `claude-guardian ensure-floor` once per boot. It
+  counts the instances that would actually come up — a config file in
+  `$INSTANCES_DIR` *and* an enabled unit, since `deactivate` leaves the
+  file behind — and if that count is zero it recreates the default
+  instance and starts it. An existing `claude-code` config is reused rather
+  than overwritten (that is the `deactivate` case, and the operator's
+  workdir/args are theirs); only a genuinely missing one is written from
+  the global defaults. It starts the instance with `systemctl start
+  --no-block`, never `enable --now`: this unit runs inside the boot
+  transaction, and blocking there on another unit's start job is how a boot
+  deadlocks.
 - **tmux layer** recovers from: the `claude` process itself exiting for any
   reason, while the *session* (its scrollback, its pty) is preserved. This
   is what makes Ctrl+C safe to send inside the session without losing state
@@ -291,6 +315,7 @@ Every path below is configurable only via the constants near the top of `bin/cla
 | `/etc/claude-guardian/config.env` | this tool, on first `install` | global runtime configuration, shared by every instance (see below) |
 | `/etc/claude-guardian/instances/<name>.env` | this tool, on `new`/`resume` | per-instance overrides: `WORKDIR`, `CLAUDE_ARGS`, `CLAUDE_BIN`, and (if resumed) `RESUME_SESSION_ID` |
 | `/etc/systemd/system/claude-guardian@.service` | this tool, on `install` | systemd **template** unit — `claude-guardian@<name>.service` is one instance of it per running instance |
+| `/etc/systemd/system/claude-guardian-floor.service` | this tool, on `install` | the boot floor: a `oneshot` unit running `claude-guardian ensure-floor` once per boot. Separate from the template on purpose — the template's units only exist for instances that are already enabled, so none of them runs in the state the floor has to repair |
 | `/var/lib/claude-guardian/state/<name>.state` | this tool, at runtime | per-instance runtime state: `claude_session_id`, `workdir`, `created_at`, `remote_url`, `remote_url_updated_at` |
 | `/var/lib/claude-guardian/archive/<name>-<timestamp>/` | this tool, on `archive` | one directory per archived instance: `scrollback.txt`, `meta.env`, `instance.env` |
 | `/usr/local/bin/claude-guardian` | this tool, on `install` (copied from `bin/claude-guardian.sh`) | the installed CLI entry point |
@@ -318,12 +343,13 @@ Global variables live in `/etc/claude-guardian/config.env`, a plain `KEY="value"
 | `CLAUDE_PROJECTS_DIR` | where Claude Code keeps conversation transcripts; read-only, checked before resuming a conversation after a restart | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects` | global | no |
 | `RESUME_AFTER_RESTART` | `1`: after a restart that took the tmux session with it, bring the instance back on the conversation it already had; `0`: always start a new one | `1` | global, overridable per instance | no |
 | `MAX_SESSIONS` | `new`/`resume` refuse once this many instances already exist; `0` = no limit | `0` | global | no |
+| `ENSURE_DEFAULT_INSTANCE` | `1`: at boot, when no instance would come up at all, create and start the default `claude-code` one from the global values above; a host that already has an enabled instance is never touched. `0`: such a host boots with nothing, and recovering it is a manual `new`. Note the interaction with `deactivate`: at `1`, deactivating the *last* instance is undone at the next boot — that is deliberate (the guarantee wins over the bookkeeping) and `deactivate` says so before it acts | `1` | global | no |
 
 ## Setup from scratch
 
 1. Clone the repo (a tag, not the branch tip) onto the target Debian server, as root — verify: `git clone ...` exits 0 and `bin/claude-guardian.sh` exists.
 2. `bash bin/claude-guardian.sh check` — verify: prints the three check sections (`apt dependencies`, `claude CLI`, `login state`) with `[ok]`/`[missing]`/`[warn]` markers and does not modify anything.
-3. `bash bin/claude-guardian.sh install` — verify: ends with `install complete`; `systemctl is-enabled claude-guardian@claude-code` prints `enabled` (the default instance is created and enabled automatically).
+3. `bash bin/claude-guardian.sh install` — verify: ends with `install complete`; `systemctl is-enabled claude-guardian@claude-code` prints `enabled` (the default instance is created and enabled automatically) and `systemctl is-enabled claude-guardian-floor` also prints `enabled` (the boot floor).
 4. `claude-guardian start` — verify: `systemctl is-active claude-guardian@claude-code` prints `active`.
 5. `claude-guardian attach` — verify: drops you into a live `claude` terminal inside tmux (name defaults to `claude-code`), and the pane shows a `/remote-control is active ... https://claude.ai/code/session_...` line — that URL is controllable from the web or a phone independent of this SSH session, and is also printed by `claude-guardian url claude-code` without attaching at all. Detach with the tmux prefix (default `Ctrl+b`) then `d` — **not** Ctrl+C.
 6. `claude-guardian new second-instance` — verify: `claude-guardian list` shows two rows (`claude-code`, `second-instance`), each with its own `SYSTEMD`/`TMUX`/`URL` columns, confirming both are independently supervised and remotely controllable.
@@ -333,7 +359,8 @@ Global variables live in `/etc/claude-guardian/config.env`, a plain `KEY="value"
 10. `claude-guardian resume second-instance` (or the exact archive id from step 9) — verify: `claude-guardian list` shows `second-instance` again, and `claude-guardian attach second-instance` continues the same conversation instead of starting fresh.
 11. Disconnect Remote Control from inside the session (`/remote-control` → `Disconnect this session`) and detach — verify: within `REMOTE_CONTROL_CHECK_SEC` (5s by default) `claude-guardian logs claude-code` shows `remote control disconnected ... reconnecting` followed by a *new* URL, and `claude-guardian url claude-code` prints that new URL. Leave the instance connected and detached for several minutes afterwards — verify the log stays completely silent, i.e. checking every tick costs nothing visible and types nothing. To exercise the reconnect backoff, disconnect and then immediately break reconnection (e.g. take the network down): the `reconnecting` line must appear at most once per `REMOTE_CONTROL_RECONNECT_BACKOFF_SEC`, not once per tick.
 12. With the default `UNATTENDED_NUDGE_SEC=0`: trigger a confirmation dialog (easiest with `--permission-mode default`: ask it to run any shell command), detach, and leave it for several minutes — verify: `claude-guardian logs claude-code` never shows a `sending Enter` line and the dialog is still waiting when you come back. Nothing answers it for you. Then set `UNATTENDED_NUDGE_SEC="60"` in `/etc/claude-guardian/config.env`, `claude-guardian restart claude-code`, and repeat — verify: at the 60s mark the log shows `has been waiting on a confirmation for Ns with nobody attached` followed by `sending Enter`, and the dialog is gone. Reattach and detach once more — verify it does not fire again immediately (timers reset on attach). Set it back to `0` afterwards.
-13. `reboot` the host — verify: after boot, every instance that was `activate`d (not `deactivate`d) is `active` again without manual intervention, `claude-guardian logs <name>` shows `continuing this instance's previous conversation (<uuid>)`, and attaching shows the conversation from before the reboot rather than an empty one. To rehearse this without rebooting: `claude-guardian stop <name>`, `tmux -S /run/claude-guardian/tmux.sock kill-session -t <name>`, `claude-guardian start <name>`.
+13. The boot floor. `claude-guardian deactivate <name> --yes` every instance until none is enabled — verify: the last one warns that the host would boot with nothing (without `--yes` it refuses in a non-interactive shell rather than acting). Then `systemctl start claude-guardian-floor` — verify: `journalctl -u claude-guardian-floor` shows `no instance would come up at boot` followed by `instance 'claude-code' enabled and starting`, and within a few seconds `claude-guardian list` shows `claude-code` as `active`/`up`. Run `systemctl restart claude-guardian-floor` again — verify it now logs `1 instance(s) already enabled — nothing to do` and no second session appears. Set `ENSURE_DEFAULT_INSTANCE="0"` and repeat from an empty state — verify it logs `disabled, doing nothing` and creates nothing.
+14. `reboot` the host — verify: after boot, every instance that was `activate`d (not `deactivate`d) is `active` again without manual intervention, `claude-guardian logs <name>` shows `continuing this instance's previous conversation (<uuid>)`, and attaching shows the conversation from before the reboot rather than an empty one. To rehearse this without rebooting: `claude-guardian stop <name>`, `tmux -S /run/claude-guardian/tmux.sock kill-session -t <name>`, `claude-guardian start <name>`.
 
 This project is not deployed with Docker; steps above are the full deployment procedure.
 
@@ -356,6 +383,27 @@ sufficient, without needing the rest of the repo.
 
 ## Known limitations & gotchas
 
+- **The boot floor runs at boot, not continuously.** `ensure-floor` is a
+  `oneshot`, so archiving the last instance mid-session leaves the host with
+  nothing running until the next reboot (or a manual `claude-guardian
+  ensure-floor` / `new`). That is intentional: a floor that re-created an
+  instance seconds after you archived one would make `archive` unusable, and
+  the warning added in the same release is what covers the interactive case.
+  The consequence to remember is that "the floor has your back" is a
+  statement about reboots only.
+- **At `ENSURE_DEFAULT_INSTANCE=1`, deactivating the last instance is undone
+  at the next boot.** `deactivate` promises "won't restart at boot" and the
+  floor promises "something is always running"; when the instance in
+  question is the only one, they contradict each other and the floor wins.
+  `deactivate` prints exactly this before it acts, so the surprise is
+  front-loaded rather than discovered after a reboot — but a host that is
+  genuinely meant to boot idle needs `ENSURE_DEFAULT_INSTANCE=0`, not
+  `deactivate`.
+- **The floor's fallback instance is a fresh conversation, not the one you
+  archived.** When no `claude-code` config exists it is written from the
+  global `WORKDIR`/`CLAUDE_ARGS`, and the new session starts empty. Coming
+  back on a previous conversation is `resume <archive-id>`'s job; the floor
+  only guarantees that *a* session exists.
 - **`UNATTENDED_NUDGE_SEC` (auto-Enter) is off by default since v0.6.0, and
   turning it on is a deliberate safety tradeoff, not a neutral convenience
   feature.** Everything below describes what you are opting into; at the
