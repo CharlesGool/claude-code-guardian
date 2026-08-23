@@ -1,9 +1,9 @@
 ---
 project: claude-code-guardian
-version: v0.9.0
+version: v0.9.1
 status: active
 branch: main
-updated: 2026-08-21
+updated: 2026-08-23
 ---
 
 # Status
@@ -11,8 +11,18 @@ updated: 2026-08-21
 **Notion:** private mirror (not published)
 **Repo:** https://github.com/CharlesGool/claude-code-guardian (public, GPL-3.0)
 **Snapshots:** maintained privately (not published)
-**Release:** https://github.com/CharlesGool/claude-code-guardian/releases/tag/v0.9.0
-**In progress:** v0.9.0 released. It makes the tool's founding promise — "at
+**Release:** https://github.com/CharlesGool/claude-code-guardian/releases/tag/v0.9.1
+**In progress:** v0.9.1 released — a one-line bug fix. `claude-guardian
+attach` was dead on arrival: it exited with `exec: tmux_cmd: not found`
+because `cmd_attach` `exec`'d the `tmux_cmd` shell helper as though it were a
+binary on `PATH`. Found in real use trying to attach to a live instance.
+Fixed by inlining the `tmux -S "$TMUX_SOCKET" attach` call. Nothing else
+changed; every other subcommand was unaffected. Verified: shellcheck-clean,
+and the fixed script run against a live session now reaches `tmux` (fails
+only with the expected "not a terminal" in a non-tty) instead of dying on
+`tmux_cmd`. Redeployed to `/usr/local/bin` after tagging.
+
+Previously, in v0.9.0: released. It makes the tool's founding promise — "at
 least one session is always available" — an enforced property instead of an
 emergent one. Until now it held only because `install` enabled the default
 instance and nobody had archived it; archiving or deactivating the last

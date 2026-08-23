@@ -4,6 +4,11 @@ Newest version first. Only changes a user can perceive — internal refactors do
 not need an entry. Draft from `git log <previous-tag>..HEAD --oneline`, then
 rewrite in user-facing terms.
 
+## v0.9.1 — 2026-08-23
+
+### Fixed
+- **`claude-guardian attach` now works.** It exited immediately with `exec: tmux_cmd: not found` instead of attaching: the command tried to `exec` an internal shell helper as though it were a program on `PATH`. Attaching now drops you into the session's terminal, exactly as `DESIGN.md`'s walkthrough describes. Every other command (`url`, `logs`, `list`, …) was unaffected — the fault was isolated to `attach`.
+
 ## v0.9.0 — 2026-08-21
 
 The tool's founding promise — "at least one session is always available" —

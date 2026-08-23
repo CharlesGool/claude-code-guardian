@@ -33,7 +33,7 @@ Non-goals: it does not install or update the Claude Code CLI itself, and it does
 ```bash
 # Clone a tag, not the branch tip — the tip can be mid-change.
 # List available tags: git ls-remote --tags <repo-url>
-git clone --depth 1 --branch v0.9.0 https://github.com/CharlesGool/claude-code-guardian.git
+git clone --depth 1 --branch v0.9.1 https://github.com/CharlesGool/claude-code-guardian.git
 cd claude-code-guardian
 bash bin/claude-guardian.sh install
 ```

@@ -1423,7 +1423,10 @@ cmd_attach() {
   session_exists "$name" \
     || die "no live tmux session '$name' on socket $TMUX_SOCKET (is 'claude-guardian@${name}' running? check '$PROG_NAME list')"
   log "attaching to '$name' — detach with the tmux prefix + d (NOT Ctrl+C, which restarts claude instead)"
-  exec tmux_cmd attach -t "$name"
+  # exec replaces this shell, so it needs a real binary — the tmux_cmd shell
+  # function is not on PATH and 'exec tmux_cmd ...' fails with "not found".
+  # Inline what tmux_cmd expands to instead.
+  exec tmux -S "$TMUX_SOCKET" attach -t "$name"
 }
 
 cmd_logs() {
