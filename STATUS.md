@@ -45,6 +45,21 @@ observed live on this host:
    Simultaneous loss on independent instances points at that shared path,
    not at anything per-session.
 
+**2026-08-23, later — the gate is passed.** The URL minted by the manual
+`Disconnect` + `/remote-control` sequence was confirmed by the operator to
+drive its session normally from a remote client, so the repair path is
+proven end to end, not just locally. Both live instances were repaired this
+way. That was the outstanding condition in the 2026-08-23 DECISIONS entry,
+so recovering the withdrawn v0.7.0 Remote Control work is now unblocked —
+and inspecting the bundle shows v0.7.0 already implements exactly this
+sequence (it detects the dialog, moves the cursor onto `Disconnect this
+session`, activates it, then re-runs `/remote-control`), plus guards this
+session's manual run did not have: it stops rather than typing further if
+the session still reports Remote Control up after the disconnect, and
+refuses outright when the session is parked on a confirmation dialog, where
+`Up`/`Enter` would answer that dialog instead. It also carries the isolated
+test suite that has been written and thrown away twice.
+
 Not a defect of this tool: the drop itself (also seen on an unsupervised
 `claude`). Squarely this tool's defect: that it stays broken, because the
 repair is inert and its success criterion re-reads a value that cannot
