@@ -8,6 +8,73 @@ already-rejected option gets recommended again two weeks later.
 
 ---
 
+## 2026-08-23 — the unreachable-session failure is understood; it reopens the v0.7.0 withdrawal
+
+- **Context:** the operator reported the long-standing symptom again — a
+  session shows `(no content)` on the web, a desktop app stuck at
+  `connecting`, a phone app claiming `connected`, and attaching over SSH
+  works perfectly while none of the remote clients do. It was believed to
+  be undiagnosable from the host ("nothing here can detect that state").
+  That belief was wrong, and the tool comes out worse than it did under it.
+- **What was actually observed**, live, before touching anything:
+  - Two independent instances logged `remote control disconnected` within
+    one second of each other, were each sent `/remote-control`, and three
+    seconds later the supervisor logged a URL **identical** to the
+    pre-disconnect one. A real re-establish mints a new id, so nothing was
+    rebuilt — and it recorded success anyway.
+  - Driving the TUI by hand explains it: `/remote-control` on a session
+    that still believes it is connected only opens an informational dialog
+    (`Disconnect this session` / `Show QR code` / `Continue`) and rebuilds
+    nothing. **The supervisor's sole repair action is inert in precisely
+    the state that needs repairing.**
+  - That dialog's `Disconnect this session`, then `/remote-control`,
+    performs a real reconnect and mints a new id. The primitive exists.
+  - `bridgeSessionId` **changes** across a real reconnect, so it is a valid
+    proof of success — as a *change*, never as "non-null".
+  - The failure self-locks: `claude` rewrites its session file only on
+    status change, so after a failed repair the stale non-null id sits
+    there (6.2h when caught) and the 5-second check reads "connected"
+    forever. The log stays clean, which is why this looked undetectable.
+  - Host TCP state is not a health signal on this network: egress crosses a
+    transparent proxy, so the client socket stays ESTABLISHED with
+    keepalives answered by the proxy after the far leg is gone. Two
+    independent instances dropping in the same second implicates that
+    shared path, not anything per-session.
+- **Decision:** record this as a settled defect of *this tool* and make
+  fixing it the top backlog item. Split the blame honestly: the drop itself
+  is not ours (it happens to an unsupervised `claude` too), but staying
+  broken is — the repair is inert and its success criterion re-reads a
+  value that cannot change when the repair does nothing.
+- **This bears directly on the 2026-08-21 withdrawal below.** The entry
+  that withdrew v0.7.0/v0.8.0 recorded that the deciding experiment had not
+  been run. It has now been run, and it points the other way: v0.7.0's two
+  central mechanisms — require a *changed* bridge id as proof, and tear
+  down before rebuilding — are exactly what today's evidence says are
+  needed. **This entry does not reverse that decision**; the withdrawal
+  also removed other things, and the operator has not yet confirmed the new
+  URL works end-to-end from a remote client. It records that the premise
+  the withdrawal rested on no longer holds, so recovering the bundled refs
+  must be reassessed rather than left closed.
+- **Rejected:**
+  - **Treating `claude-guardian url` as also broken** — it was suspected
+    and cleared in the same session: it reads the live session file and
+    followed the new id correctly. Fixing what is not broken would have
+    obscured the one thing that is.
+  - **Blaming the transparent proxy and stopping there** — it is the most
+    likely trigger, but the tool is supposed to survive triggers it does
+    not control. A repair that cannot repair is a defect regardless of what
+    knocked the connection down.
+  - **Restarting `claude` to recover** — it works, but it is a much larger
+    hammer than the dialog sequence, and resume-after-restart is a separate
+    mechanism with its own failure modes. Not needed once the repair is
+    real.
+- **Verified:** every finding above was observed directly on a live
+  instance — the informational dialog and its options, the successful
+  `Disconnect` + `/remote-control` reconnect, the changed `bridgeSessionId`,
+  and `url` tracking the new value. Not yet verified: that the newly minted
+  URL actually drives the session from a remote client. That is the
+  operator's test and it gates the reassessment above.
+
 ## 2026-08-21 — enforce the "at least one session" floor, and default it to on
 
 - **Context:** the operator asked whether a host whose resident sessions had

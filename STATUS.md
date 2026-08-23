@@ -12,7 +12,49 @@ updated: 2026-08-23
 **Repo:** https://github.com/CharlesGool/claude-code-guardian (public, GPL-3.0)
 **Snapshots:** maintained privately (not published)
 **Release:** https://github.com/CharlesGool/claude-code-guardian/releases/tag/v0.9.1
-**In progress:** v0.9.1 released — a one-line bug fix. `claude-guardian
+**In progress:** 2026-08-23 — **the "unreachable while the host looks
+healthy" failure was reproduced and its mechanism is now understood.** This
+is the open question the overnight experiment was meant to answer, and the
+answer is worse than "we cannot detect it": the supervisor's repair is a
+no-op, and one failed repair silences every future one. Evidence, all
+observed live on this host:
+
+1. Two independent instances were logged as `remote control disconnected`
+   within one second of each other, then each was sent `/remote-control`,
+   and three seconds later the supervisor logged a URL *identical to the
+   pre-disconnect one*. A genuine re-establish always mints a new id, so
+   nothing had been rebuilt — yet it recorded success.
+2. Driving the TUI by hand shows why. `/remote-control` on a session that
+   still believes it is connected only opens an informational dialog
+   ("This session is available at …") with `Disconnect this session` /
+   `Show QR code` / `Continue`. It rebuilds nothing. The supervisor's one
+   repair action is inert in exactly the state that needs repairing.
+3. The dialog's `Disconnect this session`, followed by `/remote-control`,
+   *does* perform a real reconnect and mints a new id. So the primitive
+   needed for a working repair exists and is reachable by keystroke.
+4. `bridgeSessionId` **changes** across a real reconnect. It is therefore
+   usable as proof of success — but only as a *change*, never as
+   "non-null", which is what the current check tests.
+5. The failure self-locks. `claude`'s session file is rewritten only on
+   status change, so after a failed repair the old non-null id sits there
+   indefinitely (6.2h when caught). The 5-second check reads "connected"
+   forever and never retries. The log stays clean.
+6. Host-side TCP state is worthless as a health signal here: egress
+   traverses a transparent proxy, so the client socket stays ESTABLISHED
+   with keepalives answered by the proxy while the far leg is gone.
+   Simultaneous loss on independent instances points at that shared path,
+   not at anything per-session.
+
+Not a defect of this tool: the drop itself (also seen on an unsupervised
+`claude`). Squarely this tool's defect: that it stays broken, because the
+repair is inert and its success criterion re-reads a value that cannot
+change when the repair does nothing. Note this is precisely what the
+withdrawn v0.7.0 addressed — proof-by-changed-id, and tear down before
+rebuilding. Reassessing that withdrawal is now the top backlog item.
+`claude-guardian url` was suspected too and cleared: it tracks the live
+value correctly.
+
+Previously, in v0.9.1: released — a one-line bug fix. `claude-guardian
 attach` was dead on arrival: it exited with `exec: tmux_cmd: not found`
 because `cmd_attach` `exec`'d the `tmux_cmd` shell helper as though it were a
 binary on `PATH`. Found in real use trying to attach to a live instance.
@@ -52,7 +94,7 @@ withdrawal cost. v0.6.2 released. v0.6.1 tried to fix the reconnect-timer seedin
 Previously, in v0.5.0: ships `skills/claude-session/`, the Agent Skill that drives these commands from plain language.
 
 Previously, in v0.4.0: Clears both known issues left by v0.3.0 (see DECISIONS.md, 2026-08-17, the "resume the conversation across a reboot" and "nudge only a session that is actually parked" entries). An instance now comes back from a reboot on the conversation it already had, via `claude --resume` gated on the transcript still existing under `$CLAUDE_PROJECTS_DIR` (`RESUME_AFTER_RESTART=0` opts out), falling back to a new conversation — once, not in a loop — if `claude` rejects the resume. The unattended Enter is now gated on Claude Code's own `status` field: only a session reporting `waiting` (parked on a confirmation dialog) for a full `UNATTENDED_NUDGE_SEC` is typed into, so `busy`/`idle` sessions, including ones being driven from claude.ai, are left alone. `MAX_SESSIONS` now defaults to `0` = no limit. Verified three ways before tagging: shellcheck-clean; 38 isolated cases with a stub `claude` on a private tmux socket (transcript found/missing/wrong-workdir, resume vs fresh vs opted-out, a rejected resume falling back instead of looping, status parsing with PID and sessionId mismatches, and the nudge across `busy`/`idle`/fresh-dialog/stale-dialog/no-session-file); and live on the maintainer's host with the real binary on a throwaway third instance — a simulated reboot brought back the marker turn from before it (and, incidentally, the same claude.ai URL), and a real confirmation dialog left unanswered for 16s was cleared by the supervisor at the 15s mark it was configured with, with the two production instances untouched throughout.
-**Next:** 2026-08-21 leave the running `claude-code` instance idle overnight and record whether it also goes unreachable — the instance is already up (the v0.9.0 boot floor started it during release testing), so this is `claude-guardian url claude-code` now and again in the morning; the result is what decides whether the withdrawn Remote Control work is recovered
+**Next:** 2026-08-23 make the supervisor's Remote Control repair actually repair — today it sends `/remote-control`, which on a session that believes it is connected only opens an informational dialog and rebuilds nothing, then accepts an unchanged `bridgeSessionId` as proof of success and never retries. The working sequence is that dialog's `Disconnect this session` then `/remote-control`, and a real reconnect *changes* the id, so success must be tested as "changed", never as "non-null". Start from `capture_remote_control_url` and the check in bin/claude-guardian.sh, and read the 2026-08-23 DECISIONS.md entry — the withdrawn v0.7.0 already implemented both halves of this, so recovering it from the bundle is likely cheaper than rewriting
 **Known issues:**
 - The boot floor is a `oneshot`: it runs at boot, not continuously. Archiving
   the last instance mid-session still leaves the host with nothing running
@@ -64,10 +106,15 @@ Previously, in v0.4.0: Clears both known issues left by v0.3.0 (see DECISIONS.md
   at boot". Deliberate — the guarantee wins — and `deactivate` says so
   before acting; a host meant to boot idle needs the setting at `0`.
 - A session can go unreachable from claude.ai while everything on this host
-  looks healthy, and there is still no command that repairs it: attach and type
-  `/remote-control` by hand. Observed on supervised instances and on a plain
-  `claude` this tool was not supervising, so the trigger is not known to be
-  local. This is the open question above, not a settled defect.
+  looks healthy, and there is still no command that repairs it. As of
+  2026-08-23 this is a **settled defect, not an open question** — see the
+  six numbered findings above. Two things matter for anyone hitting it now:
+  attaching and typing `/remote-control` **does not fix it** (it only opens
+  an informational dialog on a session that believes it is connected); the
+  repair that works is that dialog's `Disconnect this session` followed by
+  `/remote-control`, which mints a new URL. The old URL is dead afterwards.
+  The supervisor performs the useless half of that automatically and then
+  records success, which is why the state persists silently.
 - An instance parked on a confirmation dialog with nobody around now stays parked until a human answers it. That is the v0.6.0 tradeoff, not a defect, but it does mean an abandoned instance can sit idle indefinitely; set `UNATTENDED_NUDGE_SEC` above `0` to opt back into self-unsticking, and re-read DESIGN.md → Known limitations before doing so.
 - Resume-after-reboot depends on Claude Code's transcript directory naming (working directory with every non-alphanumeric replaced by `-`), verified against 2.1.202. If that convention changes, every reboot silently starts a fresh conversation again — nothing errors, so the symptom is the only signal.
 **Blocked on:** nothing.
