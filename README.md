@@ -1,6 +1,6 @@
 # claude-code-guardian
 
-**English** | [简体中文](README.zh.md)
+**English** | [简体中文](translated_zh_cn/README_zh_cn.md)
 
 Keeps one or more named, remotely-attachable Claude Code (`claude`) sessions alive on a Debian server, surviving both reboots and the `claude` process itself being killed (Ctrl+C, crash, `exit`). Root installs and supervises; the sessions themselves run as an ordinary account.
 

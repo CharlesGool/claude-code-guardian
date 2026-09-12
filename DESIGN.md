@@ -1,6 +1,6 @@
 # claude-code-guardian — Design
 
-**English** | [简体中文](DESIGN.zh.md)
+**English** | [简体中文](translated_zh_cn/DESIGN_zh_cn.md)
 
 > Success criterion for this document: someone else, on a different machine,
 > can rebuild this project from it. Assume the reader cannot see your machine.

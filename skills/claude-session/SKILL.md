@@ -1,6 +1,6 @@
 ---
 name: claude-session
-description: 'Manage remotely-attachable, root-managed Claude Code sessions on this host via claude-guardian. Use when the user asks to create/open a new persistent remote-controllable Claude conversation ("开一个常驻对话", "新建一个远程对话"), list active sessions ("有哪些常驻对话", "列一下我的对话"), get a session''s claude.ai remote-control URL without attaching, pause/deactivate a session without killing it ("取消激活", "暂停这个对话"), permanently archive a session ("归档这个对话", "存档并结束"), resume an archived conversation ("恢复归档的对话", "继续之前归档的那个"), or fully tear down claude-guardian. Do NOT use for ordinary git/deploy/systemd tasks unrelated to claude-guardian-managed sessions.'
+description: 'Manage remotely-attachable Claude Code sessions on this host via claude-guardian (root installs and supervises them; they run as the configured session account). Use when the user asks to create/open a new persistent remote-controllable Claude conversation ("开一个常驻对话", "新建一个远程对话"), list active sessions ("有哪些常驻对话", "列一下我的对话"), get a session''s claude.ai remote-control URL without attaching, pause/deactivate a session without killing it ("取消激活", "暂停这个对话"), permanently archive a session ("归档这个对话", "存档并结束"), resume an archived conversation ("恢复归档的对话", "继续之前归档的那个"), or fully tear down claude-guardian. Do NOT use for ordinary git/deploy/systemd tasks unrelated to claude-guardian-managed sessions.'
 allowed-tools: Bash
 ---
 
@@ -19,6 +19,24 @@ or archive one of these sessions.
 `systemctl list-unit-files 'claude-guardian@*'`). If it isn't yet (e.g. this
 host is still on an unreleased branch of the tool), say so instead of
 guessing at command output — do not fabricate `list`/`url` results.
+
+## Which commands need root
+
+Every command that changes something — `new`, `activate`, `deactivate`,
+`archive`, `resume`, `rm-archive`, `start`/`stop`/`restart`, `install`,
+`purge` — writes to `/etc/claude-guardian`, `/var/lib/claude-guardian` or
+systemd, and refuses to run unprivileged with `must be run as root (try
+sudo)`. Prefix those with `sudo` unless this session is already root. The
+read-only ones (`list`, `url`, `archives`, `status`, `logs`, `check`) and
+`attach` work as the session account directly.
+
+The session itself does **not** run as root: `RUN_AS_USER` in
+`/etc/claude-guardian/config.env` names the account that owns the tmux
+server and every `claude` process. Two consequences worth stating to the
+user rather than discovering: `new --workdir` has to name a directory that
+account can actually enter, and an archived conversation can only be
+resumed under the account that created it — transcripts live in that
+account's `~/.claude`.
 
 ## Command reference
 

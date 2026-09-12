@@ -1,5 +1,7 @@
 # Backlog
 
+**English** | [简体中文](translated_zh_cn/BACKLOG_zh_cn.md)
+
 The requirement list. Everything that was asked for, most important first,
 ticked off as it gets done. This is the file that answers "what was I going to
 do next?" after a two-week gap, and the place requirements go when a session
@@ -33,6 +35,8 @@ except at the bottom" is one.
 - [x] 2026-09-12 run the supervised session as an unprivileged account instead of root, with `claude --dangerously-skip-permissions` — shipped in v0.10.0 as `RUN_AS_USER`: root installs and supervises, the tmux server and every `claude` process belong to that account, and the flag is the shipped default because claude refuses it as root
 - [x] 2026-09-12 stop one instance from reaching another instance's tmux session — every `-t` target was a bare session name and tmux prefix-matches, so `claude-code` resolved to a live `claude-code-work`, `send-keys` included; all targets are now exact (`=name` / `=name:`), shipped in v0.10.0
 - [x] 2026-08-23 leave the running `claude-code` instance idle overnight and record whether it also goes unreachable — **answered: yes.** Both instances dropped simultaneously after ~6h idle, the supervisor's repair was inert, and it recorded success from an unchanged id. Full findings in STATUS.md and the 2026-08-23 DECISIONS.md entry; this is what reopens the v0.7.0 question
+- [ ] 2026-09-12 add the `zh_tw` translations — v0.10.0 migrated the Chinese docs to `translated_zh_cn/` and brought all six up to date there, but `translated_zh_tw/` has never existed for this project, so `release-preflight.sh` warns on six missing files at every release
+- [ ] 2026-09-12 compact DECISIONS.md — 19 entries / 55 KB is past the 20-entry, 30 KB line the preflight warns at, and 16 entries are over ~1000 bytes each; collapse everything older than the last tag to one line per decision, in its own commit, and move the reasoning that is still load-bearing into DESIGN.md
 - [ ] 2026-08-21 confirm the boot floor across a real reboot — v0.9.0 verified it by starting `claude-guardian-floor.service` directly, which is the same code path but not the same conditions (boot ordering, `network-online.target`); deactivate every instance, reboot, expect `claude-code` active
 - [ ] 2026-08-21 commit the rest of the isolated test suite — `tests/run-as-user.sh` (32 cases, the session-account layer) went in with v0.10.0, which is the `tests/` directory and the README line; still missing are the Remote Control cases that died with the v0.7.0 withdrawal and the 48-case boot-floor suite, both of which still exist only in scratch directories
 - [ ] 2026-08-21 make `run` require an instance config file like every other command — `load_instance` silently no-ops when the file is missing, so a stale enabled unit resurrects an archived instance under global defaults instead of its own workdir/args, while `list`/`url`/`activate` all die on the same missing file; start from `load_instance` in bin/claude-guardian.sh

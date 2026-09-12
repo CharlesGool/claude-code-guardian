@@ -8,6 +8,8 @@ updated: 2026-09-12
 
 # Status
 
+**English** | [简体中文](translated_zh_cn/STATUS_zh_cn.md)
+
 **Notion:** private mirror (not published)
 **Repo:** https://github.com/CharlesGool/claude-code-guardian (public, GPL-3.0)
 **Snapshots:** maintained privately (not published)

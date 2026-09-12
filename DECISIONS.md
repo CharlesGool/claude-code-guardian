@@ -1,5 +1,7 @@
 # Decisions
 
+**English** | [简体中文](translated_zh_cn/DECISIONS_zh_cn.md)
+
 Newest first. Append only — never delete or rewrite an entry. To reverse a past
 decision, add a new entry that says so explicitly.
 

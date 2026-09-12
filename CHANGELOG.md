@@ -1,5 +1,7 @@
 # Changelog
 
+**English** | [简体中文](translated_zh_cn/CHANGELOG_zh_cn.md)
+
 Newest version first. Only changes a user can perceive — internal refactors do
 not need an entry. Draft from `git log <previous-tag>..HEAD --oneline`, then
 rewrite in user-facing terms.
