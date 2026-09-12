@@ -6,6 +6,33 @@ Newest version first. Only changes a user can perceive — internal refactors do
 not need an entry. Draft from `git log <previous-tag>..HEAD --oneline`, then
 rewrite in user-facing terms.
 
+## v0.10.1 — 2026-09-12
+
+No code changes — `bin/claude-guardian.sh` is byte-identical to v0.10.0.
+This release records the one thing v0.10.0 could not verify, and fixes the
+verification step that got it wrong.
+
+### Verified
+- **A real reboot on a host running the session as an unprivileged
+  account.** After boot the instance came back `active`/`up` with its
+  Remote Control URL and nothing done by hand; `claude` ran as the session
+  account with `--resume` on its previous conversation; `/run/claude-guardian`
+  was recreated by `RuntimeDirectory=` as `drwx------` owned by that account
+  before the supervisor started — the one link in the chain that only a real
+  boot exercises, because `/run` is an empty tmpfs at that point; the
+  first-run trust prompt was answered; and the log held no `Permission
+  denied` or root-only refusal.
+
+### Fixed
+- **The reboot check in README → Verify it works and DESIGN.md step 14 told
+  you to look for a log line that a `resume`d instance never prints.** An
+  instance created by `claude-guardian resume` has `RESUME_SESSION_ID` pinned
+  in its config, which takes precedence over `RESUME_AFTER_RESTART`, so every
+  restart logs `resuming archived conversation <uuid>` rather than
+  `continuing this instance's previous conversation`. Both mean the previous
+  conversation was picked up; the docs now name both, so a correct boot no
+  longer reads as a failed one.
+
 ## v0.10.0 — 2026-09-12
 
 The supervised session no longer runs as root. `RUN_AS_USER` names the

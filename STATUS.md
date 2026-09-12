@@ -1,6 +1,6 @@
 ---
 project: claude-code-guardian
-version: v0.10.0
+version: v0.10.1
 status: active
 branch: main
 updated: 2026-09-12
@@ -13,8 +13,19 @@ updated: 2026-09-12
 **Notion:** private mirror (not published)
 **Repo:** https://github.com/CharlesGool/claude-code-guardian (public, GPL-3.0)
 **Snapshots:** maintained privately (not published)
-**Release:** https://github.com/CharlesGool/claude-code-guardian/releases/tag/v0.10.0
-**In progress:** nothing — v0.10.0 is released.
+**Release:** https://github.com/CharlesGool/claude-code-guardian/releases/tag/v0.10.1
+**In progress:** nothing — v0.10.1 is released.
+
+In v0.10.1 (docs only, code byte-identical to v0.10.0): the real reboot
+v0.10.0 could not verify has now happened on the migrated host, and passed —
+the instance came back `active`/`up` with its URL, `claude` ran as the
+session account with `--resume` on its previous conversation, and
+`/run/claude-guardian` was recreated by `RuntimeDirectory=` as `drwx------`
+owned by that account, the one link only a real boot exercises. The same
+test showed the documented reboot check was wrong for a `resume`d instance:
+it logs `resuming archived conversation`, never `continuing this instance's
+previous conversation`, because a pinned `RESUME_SESSION_ID` takes
+precedence. README and DESIGN.md now name both lines.
 
 In v0.10.0: the supervised session no longer runs as root. `RUN_AS_USER`
 names the account that owns the tmux server, every `claude` process and
@@ -42,9 +53,9 @@ maintainer's host, migrated end to end from root to an unprivileged account
 their original conversations with their original Remote Control URLs, a
 supervisor restart leaving the tmux server and `claude` PID untouched
 (`RuntimeDirectoryPreserve`), `attach` dropping from root to the session
-account, and `run` refusing to start as the wrong one. Not verified: a real
-reboot on the migrated host, and a fresh install on a host that has no
-unprivileged account to adopt.
+account, and `run` refusing to start as the wrong one. Not verified: a fresh
+install on a host that has no unprivileged account to adopt (the real reboot
+on the migrated host was verified in v0.10.1).
 
 Two things the migration taught, both now in DECISIONS.md and BACKLOG.md: a
 tmux socket outlives its server, and a root-owned leftover made every
