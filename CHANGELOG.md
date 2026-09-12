@@ -4,6 +4,73 @@ Newest version first. Only changes a user can perceive — internal refactors do
 not need an entry. Draft from `git log <previous-tag>..HEAD --oneline`, then
 rewrite in user-facing terms.
 
+## v0.10.0 — 2026-09-12
+
+The supervised session no longer runs as root. `RUN_AS_USER` names the
+account that owns the tmux server, every `claude` process, and everything
+`claude` writes; root keeps installing and supervising. The reason is not
+hygiene: `claude` refuses `--dangerously-skip-permissions` outright when it
+runs as root, so a session that must never stop to ask for permission could
+not be had at all — and that flag is now the default.
+
+Nothing changes for an existing install. `RUN_AS_USER` falls back to `root`,
+and `install` still never rewrites a config file, so an upgraded host keeps
+running exactly as it did. Moving to an unprivileged account is a deliberate
+migration, and the conversations do not come along by themselves — README →
+Install has the sequence.
+
+### Added
+- **`RUN_AS_USER`.** The session account, written into the config by
+  `install` from the account you `sudo`'d from. The systemd template carries
+  `User=`; the socket directory arrives via `RuntimeDirectory=` (with
+  `RuntimeDirectoryPreserve=yes`, so a supervisor restart no longer risks
+  taking the live socket with it) and the state directory is chowned to that
+  account. `claude`, its login, and its `~/.claude` are all resolved **as
+  that account** — a login belongs to one user, and root being logged in
+  said nothing about the account the session would actually use.
+- **`check` reports the session account**: which account, which home, and
+  whether `CLAUDE_ARGS` and that account are a legal pairing. Running it
+  unprivileged skips the checks it cannot make instead of failing them.
+- **The first-run trust prompt is answered.** Opening a directory an account
+  has never opened before, `claude` asks whether you trust it — with **No,
+  exit** preselected. Unattended, the Enter this tool sends to clear
+  onboarding screens selected exactly that, and the instance respawned into
+  the same screen forever. That screen is now recognised and answered
+  *yes*; see `DESIGN.md` → Known limitations for why that is defensible and
+  when it is not what you want.
+- **A tmux socket left behind by a previous session account is cleaned up**
+  on `install` — and refused, with an explanation, when a server of that
+  account is still running on it, rather than orphaning its sessions.
+
+### Changed
+- **`CLAUDE_ARGS` defaults to `--dangerously-skip-permissions
+  --remote-control`.** A root install gets `--permission-mode auto
+  --remote-control` instead, and the impossible combination (that flag plus
+  a root session) is refused by `install`, `new` and `run` rather than left
+  to respawn forever. Existing configs are untouched.
+- **`WORKDIR`, `CLAUDE_SESSIONS_DIR` and `CLAUDE_PROJECTS_DIR` now default
+  to the session account's home and `~/.claude`**, read from `passwd` rather
+  than `$HOME` — under `sudo`, `$HOME` is root's and every one of these
+  would have pointed at the wrong account's files.
+- **`install` needs `sudo`, and `attach` drops to the session account**
+  instead of attaching as root.
+- **`run` refuses to start when it is running as the wrong account**, which
+  means the installed unit predates the config. Starting anyway would have
+  built the tmux server, and the conversation, under the wrong user.
+- **Preflight only installs apt packages when it is root**; the unprivileged
+  supervision loop now says which packages are missing and what to run,
+  instead of failing on apt's own permission error.
+
+### Fixed
+- **An instance could type into another instance's conversation.** Every
+  tmux target was a bare session name, and tmux falls back to prefix
+  matching: with `claude-code` and `claude-code-work` both present,
+  commands aimed at the former landed on the latter — including `send-keys`,
+  i.e. `/remote-control` and a bare Enter going into someone else's session.
+  All targets are now exact matches.
+- **`claude-guardian list` printed `inactive` twice** for a stopped instance
+  and wrapped the rest of the row onto a second line.
+
 ## v0.9.1 — 2026-08-23
 
 ### Fixed

@@ -1,9 +1,9 @@
 ---
 project: claude-code-guardian
-version: v0.9.1
+version: v0.10.0
 status: active
 branch: main
-updated: 2026-08-23
+updated: 2026-09-12
 ---
 
 # Status
@@ -11,106 +11,82 @@ updated: 2026-08-23
 **Notion:** private mirror (not published)
 **Repo:** https://github.com/CharlesGool/claude-code-guardian (public, GPL-3.0)
 **Snapshots:** maintained privately (not published)
-**Release:** https://github.com/CharlesGool/claude-code-guardian/releases/tag/v0.9.1
-**In progress:** 2026-08-23 — **the "unreachable while the host looks
-healthy" failure was reproduced and its mechanism is now understood.** This
-is the open question the overnight experiment was meant to answer, and the
-answer is worse than "we cannot detect it": the supervisor's repair is a
-no-op, and one failed repair silences every future one. Evidence, all
-observed live on this host:
+**Release:** https://github.com/CharlesGool/claude-code-guardian/releases/tag/v0.10.0
+**In progress:** nothing — v0.10.0 is released.
 
-1. Two independent instances were logged as `remote control disconnected`
-   within one second of each other, then each was sent `/remote-control`,
-   and three seconds later the supervisor logged a URL *identical to the
-   pre-disconnect one*. A genuine re-establish always mints a new id, so
-   nothing had been rebuilt — yet it recorded success.
-2. Driving the TUI by hand shows why. `/remote-control` on a session that
-   still believes it is connected only opens an informational dialog
-   ("This session is available at …") with `Disconnect this session` /
-   `Show QR code` / `Continue`. It rebuilds nothing. The supervisor's one
-   repair action is inert in exactly the state that needs repairing.
-3. The dialog's `Disconnect this session`, followed by `/remote-control`,
-   *does* perform a real reconnect and mints a new id. So the primitive
-   needed for a working repair exists and is reachable by keystroke.
-4. `bridgeSessionId` **changes** across a real reconnect. It is therefore
-   usable as proof of success — but only as a *change*, never as
-   "non-null", which is what the current check tests.
-5. The failure self-locks. `claude`'s session file is rewritten only on
-   status change, so after a failed repair the old non-null id sits there
-   indefinitely (6.2h when caught). The 5-second check reads "connected"
-   forever and never retries. The log stays clean.
-6. Host-side TCP state is worthless as a health signal here: egress
-   traverses a transparent proxy, so the client socket stays ESTABLISHED
-   with keepalives answered by the proxy while the far leg is gone.
-   Simultaneous loss on independent instances points at that shared path,
-   not at anything per-session.
+In v0.10.0: the supervised session no longer runs as root. `RUN_AS_USER`
+names the account that owns the tmux server, every `claude` process and
+everything `claude` writes; root still installs and supervises. That split
+is what makes `--dangerously-skip-permissions` usable at all — `claude`
+refuses the flag as root — and it is now the shipped default, with a root
+install getting `--permission-mode auto --remote-control` instead and the
+impossible pairing refused by `install`/`new`/`run` rather than left to
+respawn forever. An existing install is unaffected: `RUN_AS_USER` falls back
+to `root` and `install` still never rewrites a config.
 
-**2026-08-23, later — the gate is passed.** The URL minted by the manual
-`Disconnect` + `/remote-control` sequence was confirmed by the operator to
-drive its session normally from a remote client, so the repair path is
-proven end to end, not just locally. Both live instances were repaired this
-way. That was the outstanding condition in the 2026-08-23 DECISIONS entry,
-so recovering the withdrawn v0.7.0 Remote Control work is now unblocked —
-and inspecting the bundle shows v0.7.0 already implements exactly this
-sequence (it detects the dialog, moves the cursor onto `Disconnect this
-session`, activates it, then re-runs `/remote-control`), plus guards this
-session's manual run did not have: it stops rather than typing further if
-the session still reports Remote Control up after the disconnect, and
-refuses outright when the session is parked on a confirmation dialog, where
-`Up`/`Enter` would answer that dialog instead. It also carries the isolated
-test suite that has been written and thrown away twice.
+Two defects were found while doing it and fixed in the same release. Every
+tmux target was a bare session name, and tmux falls back to prefix matching,
+so with `claude-code` and `claude-code-work` both present, commands aimed
+at the first landed on the second — `send-keys` included, i.e.
+`/remote-control` and bare Enters into another instance's conversation. All
+targets are now exact (`=name`, `=name:`), verified against tmux 3.2a. And
+`list` printed `inactive` twice for a stopped instance, wrapping the row.
 
-Not a defect of this tool: the drop itself (also seen on an unsupervised
-`claude`). Squarely this tool's defect: that it stays broken, because the
-repair is inert and its success criterion re-reads a value that cannot
-change when the repair does nothing. Note this is precisely what the
-withdrawn v0.7.0 addressed — proof-by-changed-id, and tear down before
-rebuilding. Reassessing that withdrawal is now the top backlog item.
-`claude-guardian url` was suspected too and cleared: it tracks the live
-value correctly.
+Verified: shellcheck-clean; `tests/run-as-user.sh`, a new 32-case isolated
+suite that installs nothing (it is also the first part of the long-standing
+"commit the test suite" backlog item to actually land); and live on the
+maintainer's host, migrated end to end from root to an unprivileged account
+— two instances archived, their transcripts copied across, both resumed on
+their original conversations with their original Remote Control URLs, a
+supervisor restart leaving the tmux server and `claude` PID untouched
+(`RuntimeDirectoryPreserve`), `attach` dropping from root to the session
+account, and `run` refusing to start as the wrong one. Not verified: a real
+reboot on the migrated host, and a fresh install on a host that has no
+unprivileged account to adopt.
 
-Previously, in v0.9.1: released — a one-line bug fix. `claude-guardian
-attach` was dead on arrival: it exited with `exec: tmux_cmd: not found`
-because `cmd_attach` `exec`'d the `tmux_cmd` shell helper as though it were a
-binary on `PATH`. Found in real use trying to attach to a live instance.
-Fixed by inlining the `tmux -S "$TMUX_SOCKET" attach` call. Nothing else
-changed; every other subcommand was unaffected. Verified: shellcheck-clean,
-and the fixed script run against a live session now reaches `tmux` (fails
-only with the expected "not a terminal" in a non-tty) instead of dying on
-`tmux_cmd`. Redeployed to `/usr/local/bin` after tagging.
+Two things the migration taught, both now in DECISIONS.md and BACKLOG.md: a
+tmux socket outlives its server, and a root-owned leftover made every
+session creation fail with `Permission denied` while the log said only that
+`claude` had exited (`install` now clears a stale one and refuses a live
+one); and `claude` asks an unanswerable question the first time an account
+opens a directory — "do you trust this folder?", with **No, exit**
+preselected — which the supervisor now answers, because the blind Enter it
+sends for onboarding screens was selecting exactly that.
 
-Previously, in v0.9.0: released. It makes the tool's founding promise — "at
-least one session is always available" — an enforced property instead of an
-emergent one. Until now it held only because `install` enabled the default
-instance and nobody had archived it; archiving or deactivating the last
-instance dropped the host to zero silently, and a reboot brought back
-nothing. Two mechanisms: `archive`/`deactivate` warn (and ask, unless
-`--yes`) when the instance being removed is the last one that would come up
-at boot, and a new `claude-guardian-floor.service` runs once per boot and
-recreates + starts the default instance when nothing else would
-(`ENSURE_DEFAULT_INSTANCE`, default `1`). Version skips v0.7.0/v0.8.0
-because both were published and withdrawn — see DECISIONS.md. Verified:
-shellcheck-clean; a 48-case isolated suite that fails 27 cases against the
-v0.6.2 baseline, so it can detect the absence of this work; and live on the
-maintainer's host with real systemd (floor unit brought a real instance back
-from zero, and was a no-op on the second run). Not verified live: an actual
-reboot, and the branch where the instance config file is missing entirely.
-An instance is running again as a result of that testing, which is what the
-overnight reachability check needs.
+Previously, in v0.9.1 and earlier: the "unreachable while the host looks
+healthy" failure was reproduced and understood — the supervisor's repair is
+a no-op (sending `/remote-control` to a session that believes it is
+connected only opens an informational dialog) and it then accepts an
+unchanged `bridgeSessionId` as proof of success, so one failed repair
+silences every future one. The working sequence is that dialog's `Disconnect
+this session` followed by `/remote-control`, which mints a new id; success
+must be tested as a *change*, never as "non-null". The withdrawn v0.7.0
+already implemented both halves, and the operator confirmed the repaired URL
+drives its session from a remote client, so recovering that work is
+unblocked — it is the top backlog item. Full evidence: DECISIONS.md
+(2026-08-23). v0.9.1 fixed `attach` dying with `exec: tmux_cmd: not found`;
+v0.9.0 made "at least one session is always available" an enforced property
+(`archive`/`deactivate` warn before the boot-enabled count reaches zero, and
+`claude-guardian-floor.service` recreates the default instance at boot).
+v0.7.0 and v0.8.0 were withdrawn on 2026-08-21; v0.6.2 is the baseline all
+later work starts from.
 
-Previously: v0.7.0 and v0.8.0 were withdrawn on 2026-08-21 — tags, the
-v0.7.0 Release and both snapshots deleted, `main` force-reset here — after
-supervised instances kept going unreachable from claude.ai. v0.6.2 is the
-baseline all later work starts from. Read DECISIONS.md (2026-08-21) before
-touching Remote Control: it records the evidence that argued against this
-call, the deciding experiment that had not been run yet, and what the
-withdrawal cost. v0.6.2 released. v0.6.1 tried to fix the reconnect-timer seeding and only patched two of its three occurrences; the third (loop start, so every restart and every boot) shipped broken and was caught by re-running the same live test. v0.6.2 patches it and the isolated suite now has a case that fails against v0.6.1. The underlying v0.6.1 defect: the reconnect backoff timer was seeded as though a reconnect had just happened, so the first drop after a supervisor restart waited out a backoff window that was protecting nothing (25s instead of 5s in the live test). v0.6.0 itself: Two changes, both from running v0.4.0 in production for an afternoon (see DECISIONS.md, 2026-08-17, "watch the connection on every tick, and stop answering dialogs by default"). (1) The Remote Control connection check moved from every 20 minutes to every supervision tick — `REMOTE_CONTROL_CHECK_SEC`, default 5s — because the check is a passive file read that types nothing, while the old cadence meant an instance could be alive but unreachable from claude.ai for up to 20 minutes; that is exactly what the operator hit with two instances at once. Reconnects, which do type `/remote-control`, are rate-limited on their own timer (`REMOTE_CONTROL_RECONNECT_BACKOFF_SEC`, 60s; 1200s in the degenerate case where no session file exists to confirm success). `REMOTE_CONTROL_REFRESH_SEC` is gone, with a startup warning if a config still sets it. (2) `UNATTENDED_NUDGE_SEC` now defaults to `0`: the supervisor no longer answers confirmation dialogs on anyone's behalf unless explicitly turned on. The v0.4.0 `waiting`-only guard was not enough — an operator reading a dialog on claude.ai is indistinguishable from an abandoned session, and it was observed answering real dialogs. Verified: shellcheck-clean; 11 isolated cases against a stub `claude` on a private tmux socket (silent while connected, no state churn, drop noticed within a tick, reconnect sent once then backed off, recovery re-recorded the new URL, a `waiting` dialog left untouched at the default, and the no-session-file slow path).
-
-Previously, in v0.5.0: ships `skills/claude-session/`, the Agent Skill that drives these commands from plain language.
-
-Previously, in v0.4.0: Clears both known issues left by v0.3.0 (see DECISIONS.md, 2026-08-17, the "resume the conversation across a reboot" and "nudge only a session that is actually parked" entries). An instance now comes back from a reboot on the conversation it already had, via `claude --resume` gated on the transcript still existing under `$CLAUDE_PROJECTS_DIR` (`RESUME_AFTER_RESTART=0` opts out), falling back to a new conversation — once, not in a loop — if `claude` rejects the resume. The unattended Enter is now gated on Claude Code's own `status` field: only a session reporting `waiting` (parked on a confirmation dialog) for a full `UNATTENDED_NUDGE_SEC` is typed into, so `busy`/`idle` sessions, including ones being driven from claude.ai, are left alone. `MAX_SESSIONS` now defaults to `0` = no limit. Verified three ways before tagging: shellcheck-clean; 38 isolated cases with a stub `claude` on a private tmux socket (transcript found/missing/wrong-workdir, resume vs fresh vs opted-out, a rejected resume falling back instead of looping, status parsing with PID and sessionId mismatches, and the nudge across `busy`/`idle`/fresh-dialog/stale-dialog/no-session-file); and live on the maintainer's host with the real binary on a throwaway third instance — a simulated reboot brought back the marker turn from before it (and, incidentally, the same claude.ai URL), and a real confirmation dialog left unanswered for 16s was cleared by the supervisor at the 15s mark it was configured with, with the two production instances untouched throughout.
 **Next:** 2026-08-23 make the supervisor's Remote Control repair actually repair — today it sends `/remote-control`, which on a session that believes it is connected only opens an informational dialog and rebuilds nothing, then accepts an unchanged `bridgeSessionId` as proof of success and never retries. The working sequence is that dialog's `Disconnect this session` then `/remote-control`, and a real reconnect *changes* the id, so success must be tested as "changed", never as "non-null". Start from `capture_remote_control_url` and the check in bin/claude-guardian.sh, and read the 2026-08-23 DECISIONS.md entry — the withdrawn v0.7.0 already implemented both halves of this, so recovering it from the bundle is likely cheaper than rewriting
 **Known issues:**
+- Changing `RUN_AS_USER` on a live host is a migration, not a setting. The
+  conversations stay in the old account's `~/.claude`, which the new one
+  cannot read, and `resume` has no `--workdir`, so an archive made under the
+  old account needs its `meta.env` edited by hand before it can be resumed
+  under the new one. README → Install has the sequence.
+- The first-run trust prompt is answered *for* you (**No, exit** is
+  preselected, so leaving it alone would respawn the instance into that
+  screen forever). The detection matches that screen's current wording — if
+  Claude Code rewords it, the loop comes back and the log will only say
+  `claude exited`.
+- `--dangerously-skip-permissions` being the default means the session has
+  the session account's full privileges, including root if that account has
+  passwordless `sudo`. The root-safe alternative is one config line, and
+  `check` reports which pairing a host is on.
 - The boot floor is a `oneshot`: it runs at boot, not continuously. Archiving
   the last instance mid-session still leaves the host with nothing running
   until the next reboot or a manual `claude-guardian ensure-floor`. That is

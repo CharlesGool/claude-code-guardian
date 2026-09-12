@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
 # claude-guardian — keeps one or more remotely-attachable Claude Code
-# sessions alive, root-managed, on a Debian server.
+# sessions alive on a Debian server. Installed and supervised by root; the
+# tmux server and every `claude` process run as RUN_AS_USER, the account
+# that owns the conversations (see the config).
 # Copyright (C) 2026 CharlesGool
 #
 # This program is free software: you can redistribute it and/or modify
@@ -61,6 +63,17 @@
 #                               default one. Run at boot by
 #                               claude-guardian-floor.service; safe to run by
 #                               hand to repair a host left with nothing
+#
+# Two accounts, and the split is the point:
+#   root            installs and supervises — every command that writes to
+#                   /etc/claude-guardian, /var/lib/claude-guardian or
+#                   systemd needs it (sudo is enough)
+#   $RUN_AS_USER    owns the tmux server, the claude process, and everything
+#                   claude writes under its ~/.claude. `install` records the
+#                   account it was sudo'd from; root is the fallback.
+# `claude` refuses --dangerously-skip-permissions when it runs as root, so
+# an unattended session that must never stop to ask needs RUN_AS_USER set to
+# a non-root account — with its own claude login.
 # ---- end of usage --------------------------------------------------------
 
 set -uo pipefail
@@ -79,9 +92,28 @@ DEFAULT_INSTANCE="claude-code"
 # ---- defaults (overridden by $CONFIG_FILE, then per-instance by
 #      $INSTANCES_DIR/<name>.env) ------------------------------------------
 TMUX_SOCKET="/run/claude-guardian/tmux.sock"
-WORKDIR="/root"
+# The account the tmux server, every `claude` process and the supervision
+# loop run as — not the account that runs the admin commands, which is still
+# root. One account per host on purpose: all instances share a single tmux
+# server, and a tmux server belongs to exactly one user. `install` writes
+# the account it was sudo'd from ($SUDO_USER) in here; the built-in fallback
+# is root so an install predating this setting behaves as it always did.
+RUN_AS_USER="root"
+# Empty = $RUN_AS_USER's home directory, read from passwd at startup. Read
+# from passwd rather than $HOME because an admin command under sudo has
+# root's $HOME, not the session owner's.
+WORKDIR=""
 CLAUDE_BIN="claude"
-CLAUDE_ARGS="--permission-mode auto --remote-control"
+# --dangerously-skip-permissions: no per-action approval at all. It is the
+#   default because an unattended session that stops to ask is a session that
+#   is stuck — but `claude` refuses the flag outright when it runs as root,
+#   which is the whole reason RUN_AS_USER exists. A root install gets
+#   $DEFAULT_CLAUDE_ARGS_ROOT written into its config instead, and the
+#   combination "RUN_AS_USER=root plus this flag" is refused at the door
+#   rather than left to crash-loop (see DECISIONS.md, 2026-08-21).
+# --remote-control: prints the claude.ai/code/... URL this tool tracks.
+CLAUDE_ARGS="--dangerously-skip-permissions --remote-control"
+DEFAULT_CLAUDE_ARGS_ROOT="--permission-mode auto --remote-control"
 CHECK_INTERVAL_SEC="5"
 REQUIRED_APT_PKGS="tmux uuid-runtime"
 # When no tmux client is attached and claude has been parked on a
@@ -113,12 +145,14 @@ NO_SESSION_FILE_RETRY_SEC="1200"
 # authoritative answer to both "is it still connected?" and "what is the
 # claude.ai URL?" — see DECISIONS.md for why it replaced scraping the
 # terminal, and DESIGN.md for the fallback when the file is absent.
-CLAUDE_SESSIONS_DIR="${CLAUDE_CONFIG_DIR:-${HOME:-/root}/.claude}/sessions"
+# Empty = $RUN_AS_USER's ~/.claude/sessions ($CLAUDE_CONFIG_DIR wins).
+CLAUDE_SESSIONS_DIR=""
 # Claude Code keeps one transcript per conversation here, in a directory
 # named after the working directory that conversation ran in. Read to answer
 # "does the conversation this instance had before the restart still exist?"
 # — see RESUME_AFTER_RESTART below.
-CLAUDE_PROJECTS_DIR="${CLAUDE_CONFIG_DIR:-${HOME:-/root}/.claude}/projects"
+# Empty = $RUN_AS_USER's ~/.claude/projects ($CLAUDE_CONFIG_DIR wins).
+CLAUDE_PROJECTS_DIR=""
 # 1: when an instance's tmux session has to be recreated (a reboot takes the
 # tmux server with it), continue the conversation that instance had before
 # instead of opening an empty one. 0: always start a new conversation.
@@ -150,8 +184,101 @@ die() {
 }
 
 require_root() {
-  [ "$(id -u)" -eq 0 ] || die "must be run as root"
+  [ "$(id -u)" -eq 0 ] \
+    || die "must be run as root (try sudo) — this command writes to $(dirname "$CONFIG_FILE"), $STATE_DIR or systemd. Only the supervised session itself runs unprivileged, as \$RUN_AS_USER."
 }
+
+# ---- the account the session runs as ------------------------------------
+
+# $RUN_AS_USER owns the tmux server, the claude process and the files claude
+# writes; root only installs and supervises. Everything derived from that
+# account is resolved here, once, after the config has been sourced —
+# passwd is the only source that stays right when an admin command runs
+# under sudo, where $HOME is root's and not the session owner's.
+#
+# Idempotent, and deliberately re-callable: `install` may adopt $SUDO_USER
+# after this has already run once, and everything derived has to move with
+# it. Hence the *_FROM_RUN_AS flags — a value the operator set in the config
+# is never overwritten, a value this function derived always is.
+resolve_run_as() {
+  RUN_AS_USER="${RUN_AS_USER:-root}"
+  RUN_AS_HOME=$(getent passwd "$RUN_AS_USER" 2>/dev/null | cut -d: -f6)
+  [ -n "$RUN_AS_HOME" ] \
+    || die "RUN_AS_USER=\"$RUN_AS_USER\" is not an account on this host (nothing for it in passwd). Fix it in $CONFIG_FILE."
+  RUN_AS_GROUP=$(id -gn "$RUN_AS_USER" 2>/dev/null || echo "$RUN_AS_USER")
+  RUN_AS_CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$RUN_AS_HOME/.claude}"
+
+  if [ -z "$WORKDIR" ] || [ -n "${WORKDIR_FROM_RUN_AS:-}" ]; then
+    WORKDIR="$RUN_AS_HOME"; WORKDIR_FROM_RUN_AS=1
+  fi
+  if [ -z "$CLAUDE_SESSIONS_DIR" ] || [ -n "${SESSIONS_DIR_FROM_RUN_AS:-}" ]; then
+    CLAUDE_SESSIONS_DIR="$RUN_AS_CLAUDE_DIR/sessions"; SESSIONS_DIR_FROM_RUN_AS=1
+  fi
+  if [ -z "$CLAUDE_PROJECTS_DIR" ] || [ -n "${PROJECTS_DIR_FROM_RUN_AS:-}" ]; then
+    CLAUDE_PROJECTS_DIR="$RUN_AS_CLAUDE_DIR/projects"; PROJECTS_DIR_FROM_RUN_AS=1
+  fi
+}
+
+# runuser lives in /usr/sbin, which is on root's PATH and on systemd's but
+# not necessarily on an unprivileged one — and `check` is runnable by
+# anyone. Resolve it by path rather than reporting it missing when it isn't.
+runuser_bin() {
+  command -v runuser 2>/dev/null && return 0
+  [ -x /usr/sbin/runuser ] && { echo /usr/sbin/runuser; return 0; }
+  return 1
+}
+
+# Can this process act as $RUN_AS_USER at all? True when it already is that
+# account, or when it is root and runuser is available. `check` uses this to
+# skip the checks it cannot make, instead of reporting them as failures.
+can_act_as_run_user() {
+  [ "$(id -un)" = "$RUN_AS_USER" ] && return 0
+  [ "$(id -u)" -eq 0 ] && runuser_bin >/dev/null && return 0
+  return 1
+}
+
+# Run a command as $RUN_AS_USER: directly when that is already who we are,
+# through runuser when we are root. `claude auth status`, `command -v claude`
+# and `tmux attach` all have to run as the session owner — asking root
+# whether *root* is logged in says nothing about the account the session
+# will actually use, and that mismatch is how a "checks passed" install
+# produces an instance that cannot start.
+as_run_user() {
+  if [ "$(id -un)" = "$RUN_AS_USER" ]; then
+    "$@"
+  elif [ "$(id -u)" -eq 0 ]; then
+    local ru
+    ru=$(runuser_bin) \
+      || die "RUN_AS_USER=\"$RUN_AS_USER\" needs 'runuser' (util-linux) so root can act as that account, and it is not installed"
+    "$ru" -u "$RUN_AS_USER" -- "$@"
+  else
+    die "this has to run as $RUN_AS_USER or as root (currently $(id -un))"
+  fi
+}
+
+# Absolute path to $1 as $RUN_AS_USER sees it, or empty. HOME is forced
+# because sudo and runuser both leave it pointing at root's, and `bash -ic`
+# (not -lc) is what makes Debian's ~/.bashrc run far enough to set up PATH —
+# see the long comment in preflight_enforce.
+run_as_user_which() {
+  as_run_user env HOME="$RUN_AS_HOME" bash -ic "command -v -- '$1'" 2>/dev/null \
+    | tr -d '\r' | grep -m1 '^/' || true
+}
+
+# `claude` refuses --dangerously-skip-permissions when it runs as root: it
+# exits immediately, so the instance would be respawned forever behind a
+# clean supervisor log. Refuse at the door instead. This exact crash-loop is
+# recorded in DECISIONS.md (2026-08-21) as the real v0.7.0 regression.
+require_args_match_run_user() {
+  case " $CLAUDE_ARGS " in
+    *" --dangerously-skip-permissions "*)
+      [ "$RUN_AS_USER" != "root" ] \
+        || die "CLAUDE_ARGS contains --dangerously-skip-permissions, which claude refuses to run as root — it exits immediately and the session would respawn forever. Either set RUN_AS_USER to a non-root account in $CONFIG_FILE (that account needs its own claude login), or use CLAUDE_ARGS=\"$DEFAULT_CLAUDE_ARGS_ROOT\"."
+      ;;
+  esac
+}
+
+resolve_run_as
 
 validate_name() {
   [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]] \
@@ -175,10 +302,31 @@ confirm_or_die() {
 # status` exits 0 when logged in, 1 when not — verified directly against
 # both states, including under an isolated HOME with no credentials at all.
 is_logged_in() {
-  "$CLAUDE_BIN" auth status >/dev/null 2>&1
+  local bin="$CLAUDE_BIN"
+  # Credentials live in the *session owner's* ~/.claude, so both the binary
+  # and $HOME have to be that account's — a bare "claude" would resolve on
+  # root's PATH, and an unforced HOME would look for root's login.
+  case "$bin" in
+    /*) ;;
+    *)  bin=$(run_as_user_which "$bin"); [ -n "$bin" ] || return 1 ;;
+  esac
+  as_run_user env HOME="$RUN_AS_HOME" "$bin" auth status >/dev/null 2>&1
 }
 
 # ---- preflight ---------------------------------------------------------
+
+# Is $CLAUDE_BIN already usable as $RUN_AS_USER without resolving it? Only an
+# absolute path that exists qualifies. `command -v` in this shell is the
+# wrong question: it answers for whoever is running the admin command —
+# usually root — while the binary that has to exist is the session owner's,
+# and a host where only root has claude on its PATH would pass the old check
+# and then fail to start.
+claude_bin_is_absolute() {
+  case "$CLAUDE_BIN" in
+    /*) [ -x "$CLAUDE_BIN" ] ;;
+    *)  return 1 ;;
+  esac
+}
 
 # Report-only: never mutates the system. Used by `check`.
 preflight_report() {
@@ -196,30 +344,49 @@ preflight_report() {
   done
   [ ${#missing[@]} -eq 0 ] || ok=1
 
+  echo "== session account =="
+  echo "  [info]    RUN_AS_USER=$RUN_AS_USER (home $RUN_AS_HOME), workdir $WORKDIR"
+  case " $CLAUDE_ARGS " in
+    *" --dangerously-skip-permissions "*)
+      if [ "$RUN_AS_USER" = "root" ]; then
+        echo "  [missing] CLAUDE_ARGS has --dangerously-skip-permissions, which claude refuses as root"
+        echo "            set RUN_AS_USER to a non-root account, or CLAUDE_ARGS to \"$DEFAULT_CLAUDE_ARGS_ROOT\""
+        ok=1
+      else
+        echo "  [ok]      --dangerously-skip-permissions is paired with a non-root account"
+      fi
+      ;;
+  esac
+  if [ "$RUN_AS_USER" != "root" ] && [ "$(id -u)" -eq 0 ] && ! runuser_bin >/dev/null; then
+    echo "  [missing] runuser (util-linux) not found — root cannot act as '$RUN_AS_USER' without it"
+    ok=1
+  fi
+
   echo "== claude CLI =="
-  if command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
-    echo "  [ok]      $CLAUDE_BIN -> $(command -v "$CLAUDE_BIN")"
-  else
-    local login_resolved
-    login_resolved=$(bash -ic "command -v -- '$CLAUDE_BIN'" 2>/dev/null || true)
-    if [ -n "$login_resolved" ]; then
-      echo "  [warn]    $CLAUDE_BIN not on this shell's PATH, but resolvable via an interactive login shell: $login_resolved"
-      echo "            run/install will pick this up automatically; consider setting CLAUDE_BIN to it explicitly"
+  local resolved=""
+  if can_act_as_run_user; then
+    resolved=$(run_as_user_which "$CLAUDE_BIN")
+    if [ -n "$resolved" ]; then
+      echo "  [ok]      $CLAUDE_BIN -> $resolved (as $RUN_AS_USER)"
     else
-      echo "  [missing] $CLAUDE_BIN not found on PATH (current shell or interactive login shell)"
-      echo "            this tool does not install Claude Code; install it yourself first"
+      echo "  [missing] $CLAUDE_BIN not found for $RUN_AS_USER (neither this shell's PATH nor that account's interactive login shell)"
+      echo "            this tool does not install Claude Code; install it as $RUN_AS_USER first, or set CLAUDE_BIN to an absolute path in $CONFIG_FILE"
       ok=1
     fi
+  else
+    echo "  [skip]    can't look at $RUN_AS_USER's PATH from this account — re-run as root or as $RUN_AS_USER"
   fi
 
   echo "== login state =="
-  if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
+  if ! can_act_as_run_user; then
+    echo "  [skip]    can't check — see above"
+  elif [ -z "$resolved" ]; then
     echo "  [skip]    can't check — claude CLI not found (see above)"
   elif is_logged_in; then
-    echo "  [ok]      $CLAUDE_BIN auth status reports logged in"
+    echo "  [ok]      claude auth status reports $RUN_AS_USER is logged in"
   else
-    echo "  [missing] $CLAUDE_BIN auth status reports not logged in"
-    echo "            'install'/'new' refuse to proceed until this is fixed: run '$CLAUDE_BIN auth login' first"
+    echo "  [missing] claude auth status reports $RUN_AS_USER is not logged in"
+    echo "            'install'/'new' refuse to proceed until this is fixed: log in as that account, e.g. 'sudo -iu $RUN_AS_USER claude auth login'"
     ok=1
   fi
 
@@ -229,13 +396,22 @@ preflight_report() {
 # Enforcing: auto-installs missing apt packages, hard-fails if claude is
 # missing, only warns on login state. Used by `run`, `install`, and `new`.
 preflight_enforce() {
-  require_root
+  require_args_match_run_user
+  [ "$RUN_AS_USER" = "root" ] || can_act_as_run_user \
+    || die "RUN_AS_USER=\"$RUN_AS_USER\" but this is running as $(id -un) — run it as that account or as root"
 
   local missing=()
   for pkg in $REQUIRED_APT_PKGS; do
     dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
   done
   if [ ${#missing[@]} -gt 0 ]; then
+    if [ "$(id -u)" -ne 0 ]; then
+      # `run` is the one entry point that is deliberately unprivileged — it
+      # is the unit's ExecStart, running as $RUN_AS_USER — so it cannot
+      # install anything. Say what to do instead of dying on apt's own
+      # permission error.
+      die "missing apt package(s): ${missing[*]} — install them as root ('sudo apt-get install -y ${missing[*]}'), then restart the instance. This entry point runs as $(id -un), not root."
+    fi
     log "installing missing apt packages: ${missing[*]}"
     DEBIAN_FRONTEND=noninteractive apt-get update -qq \
       || die "apt-get update failed"
@@ -243,7 +419,7 @@ preflight_enforce() {
       || die "apt-get install failed for: ${missing[*]}"
   fi
 
-  if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
+  if ! claude_bin_is_absolute; then
     # systemd's default PATH is minimal and commonly does NOT include where
     # claude actually lives (e.g. ~/.local/bin), even though it resolves
     # fine in an interactive shell. `bash -l` alone doesn't help: Debian's
@@ -256,16 +432,22 @@ preflight_enforce() {
     # Self-heals configs left with the bare "claude" default. See
     # DECISIONS.md for the deployment failure that surfaced this.
     local login_resolved
-    login_resolved=$(bash -ic "command -v -- '$CLAUDE_BIN'" 2>/dev/null || true)
+    login_resolved=$(run_as_user_which "$CLAUDE_BIN")
+    if [ -z "$login_resolved" ] && [ -x "$RUN_AS_HOME/.local/bin/${CLAUDE_BIN##*/}" ]; then
+      # Where Claude Code's own installer puts it. Worth one explicit look:
+      # a service account's non-interactive PATH can miss ~/.local/bin
+      # entirely, and reporting "not installed" there is simply wrong.
+      login_resolved="$RUN_AS_HOME/.local/bin/${CLAUDE_BIN##*/}"
+    fi
     if [ -n "$login_resolved" ]; then
-      log "\$CLAUDE_BIN=$CLAUDE_BIN not on this shell's PATH, but resolved via an interactive login shell: $login_resolved"
+      log "\$CLAUDE_BIN=$CLAUDE_BIN is not an absolute path; resolved to $login_resolved as $RUN_AS_USER"
       CLAUDE_BIN="$login_resolved"
     else
-      die "claude CLI not found (\$CLAUDE_BIN=$CLAUDE_BIN, tried both the current and a login-shell PATH). This tool does not install Claude Code — install it first, then retry, or set CLAUDE_BIN to its absolute path in $CONFIG_FILE."
+      die "claude CLI not found for $RUN_AS_USER (\$CLAUDE_BIN=$CLAUDE_BIN, tried that account's interactive login shell and $RUN_AS_HOME/.local/bin). This tool does not install Claude Code — install it as $RUN_AS_USER, then retry, or set CLAUDE_BIN to its absolute path in $CONFIG_FILE."
     fi
   fi
 
-  is_logged_in || log "warning: claude is not logged in ('$CLAUDE_BIN auth status' failed); run '$PROG_NAME attach <name>' to log in interactively (this does not block a running instance — only 'install'/'new' hard-require login)"
+  is_logged_in || log "warning: claude is not logged in for $RUN_AS_USER ('$CLAUDE_BIN auth status' failed as that account); run '$PROG_NAME attach <name>' to log in interactively (this does not block a running instance — only 'install'/'new' hard-require login)"
 }
 
 # Hard requirement for `install`/`new` only — deliberately not folded into
@@ -352,15 +534,33 @@ write_instance_file() {
   log "wrote instance config to $(instance_file "$name")"
 }
 
+# Same split as ensure_socket_dir: the supervision loop writes state as
+# $RUN_AS_USER, but only root can create a directory under /var/lib.
+ensure_state_dir() {
+  if [ "$(id -u)" -eq 0 ]; then
+    install -d -m 0700 -o "$RUN_AS_USER" -g "$RUN_AS_GROUP" "$STATE_DIR"
+  elif [ ! -d "$STATE_DIR" ]; then
+    install -d -m 0700 "$STATE_DIR" \
+      || die "cannot create $STATE_DIR as $(id -un) — run 'sudo $PROG_NAME install' once so it is created for $RUN_AS_USER"
+  fi
+}
+
 state_file() { echo "$STATE_DIR/$1.state"; }
 
 state_set() {
   local name="$1" key="$2" val="$3" f tmp
-  install -d -m 0700 "$STATE_DIR"
+  ensure_state_dir
   f=$(state_file "$name")
   tmp="${f}.tmp.$$"
   { grep -v "^${key}=" "$f" 2>/dev/null; echo "${key}=${val}"; } > "$tmp"
   mv "$tmp" "$f"
+  # Admin commands write state too — `url` records the URL it just read —
+  # and they run as root. Leaving a root-owned file in a directory the
+  # supervisor owns is how the next unprivileged write gets a surprise, so
+  # hand it back immediately.
+  if [ "$(id -u)" -eq 0 ] && [ "$RUN_AS_USER" != "root" ]; then
+    chown "$RUN_AS_USER:$RUN_AS_GROUP" "$f" 2>/dev/null || true
+  fi
 }
 
 state_get() {
@@ -374,26 +574,75 @@ state_rm() { rm -f "$(state_file "$1")"; }
 
 # ---- tmux session management -------------------------------------------
 
+# Every -t target below names a session, and every one of them is written
+# exactly: "=<name>" for session targets, "=<name>:" for the window/pane
+# targets (the trailing colon is what makes tmux read the name as a session
+# rather than as a window to search for). Without that, tmux falls back to
+# prefix and then fnmatch matching, so an instance called 'claude-code'
+# resolves to a live 'claude-code-work' session. Not a cosmetic mix-up:
+# has-session would report a session this instance does not own, and
+# send-keys would type /remote-control, or a bare Enter, into somebody
+# else's conversation. Both forms verified against tmux 3.2a.
 tmux_cmd() {
   tmux -S "$TMUX_SOCKET" "$@"
 }
 
+# A socket file left behind by a previous $RUN_AS_USER blocks the new one:
+# the directory can be chowned, but the socket keeps its old owner and mode,
+# so the new account's tmux fails with EACCES and every session creation
+# fails behind it — with "Permission denied" as the only clue. Only root can
+# tell the two cases apart, and only root can act on either:
+#   a server of the old owner is still answering — refuse, loudly. Deleting
+#     the socket would orphan its sessions: they keep running, unreachable.
+#   nothing answers — the file is a leftover (tmux does not always unlink it)
+#     and is removed so the new owner's server can create its own.
+# Found the hard way migrating this host from root to an unprivileged
+# account; see DECISIONS.md (2026-09-12).
+reconcile_socket_owner() {
+  [ "$(id -u)" -eq 0 ] || return 0
+  [ -S "$TMUX_SOCKET" ] || return 0
+
+  local owner ru
+  owner=$(stat -c %U "$TMUX_SOCKET" 2>/dev/null) || return 0
+  [ "$owner" = "$RUN_AS_USER" ] && return 0
+
+  if ru=$(runuser_bin) && "$ru" -u "$owner" -- tmux -S "$TMUX_SOCKET" ls >/dev/null 2>&1; then
+    die "the tmux socket $TMUX_SOCKET belongs to '$owner' and a tmux server of that account is still running on it, so '$RUN_AS_USER' cannot use it — and removing it would orphan that server's sessions. Archive or kill them first (as $owner: tmux -S $TMUX_SOCKET kill-server), then re-run '$PROG_NAME install'. Nothing has been changed."
+  fi
+  log "removing a stale tmux socket at $TMUX_SOCKET left by '$owner' (no server is answering on it) so '$RUN_AS_USER' can create its own"
+  rm -f "$TMUX_SOCKET"
+}
+
+# The tmux server belongs to $RUN_AS_USER, so the directory holding its
+# socket has to as well — and under /run only root can create it. Root
+# therefore creates *and* chowns it on every root-side command, which is
+# also the repair path for a host whose RUN_AS_USER changed. The
+# unprivileged loop only ever finds it already there: systemd's
+# RuntimeDirectory= (see write_unit_template) makes it before ExecStart.
 ensure_socket_dir() {
-  install -d -m 0700 "$(dirname "$TMUX_SOCKET")"
+  local d
+  d=$(dirname "$TMUX_SOCKET")
+  if [ "$(id -u)" -eq 0 ]; then
+    install -d -m 0700 -o "$RUN_AS_USER" -g "$RUN_AS_GROUP" "$d"
+    reconcile_socket_owner
+  elif [ ! -d "$d" ]; then
+    install -d -m 0700 "$d" \
+      || die "cannot create $d as $(id -un). The unit template declares RuntimeDirectory for it, so a missing directory here usually means the installed unit predates the current config — re-run 'sudo $PROG_NAME install', then restart the instance."
+  fi
 }
 
 session_exists() {
-  tmux_cmd has-session -t "$1" 2>/dev/null
+  tmux_cmd has-session -t "=$1" 2>/dev/null
 }
 
 pane_is_dead() {
   local dead
-  dead=$(tmux_cmd list-panes -t "$1" -F '#{pane_dead}' 2>/dev/null | head -n1)
+  dead=$(tmux_cmd list-panes -t "=$1:" -F '#{pane_dead}' 2>/dev/null | head -n1)
   [ "$dead" = "1" ]
 }
 
 has_attached_client() {
-  [ -n "$(tmux_cmd list-clients -t "$1" 2>/dev/null)" ]
+  [ -n "$(tmux_cmd list-clients -t "=$1" 2>/dev/null)" ]
 }
 
 # Path to the transcript Claude Code keeps for one conversation, or failure
@@ -410,6 +659,44 @@ transcript_path() {
   f="$CLAUDE_PROJECTS_DIR/$slug/$id.jsonl"
   [ -r "$f" ] || return 1
   echo "$f"
+}
+
+# The one first-run screen that must not be answered with a bare Enter.
+# Opening a directory this account has never opened before, claude asks
+# "Is this a project you created or one you trust?" with **No, exit**
+# preselected: Enter quits, the supervisor respawns, and the instance loops
+# on that screen behind a log that only says "claude exited". It is the
+# first thing a new RUN_AS_USER hits, because trust is recorded per account
+# in its own ~/.claude and nothing carries over from the old one.
+#
+# Answering "yes" here is deliberate, not a convenience: $WORKDIR is a
+# directory the operator put in this instance's config for an unattended
+# session to work in, so there is nobody left to ask. The selection is moved
+# only when the cursor really is on "No, exit" — see DESIGN.md, Known
+# limitations.
+answer_trust_prompt() {
+  local name="$1" tries=6 pane
+  while [ "$tries" -gt 0 ]; do
+    tries=$(( tries - 1 ))
+    sleep 1
+    pane=$(tmux_cmd capture-pane -p -t "=$name:" 2>/dev/null) || return 0
+    case "$pane" in
+      *"trust this folder"*)
+        log "answering claude's first-run trust prompt for $WORKDIR (a configured workdir on an unattended session)"
+        case "$pane" in
+          *"❯ No, exit"*) tmux_cmd send-keys -t "=$name:" Down; sleep 1 ;;
+        esac
+        tmux_cmd send-keys -t "=$name:" Enter
+        sleep 2
+        return 0
+        ;;
+      *"for shortcuts"*)
+        # already at the normal prompt; nothing to answer
+        return 0
+        ;;
+    esac
+  done
+  return 0
 }
 
 # $2=1 forces a brand-new conversation, ignoring both RESUME_SESSION_ID and
@@ -445,17 +732,22 @@ create_session() {
 
   # shellcheck disable=SC2086
   tmux_cmd new-session -d -s "$name" -n claude -c "$WORKDIR" -- "$CLAUDE_BIN" $CLAUDE_ARGS $extra_args
-  tmux_cmd set-option -t "$name" remain-on-exit on
+  tmux_cmd set-option -t "=$name:" remain-on-exit on
 
-  # On a genuinely first-ever run, claude can show an onboarding/trust
-  # screen that needs Enter to accept the default before it reaches the
-  # normal prompt — observed needing two Enters, not one. An extra Enter
-  # once claude is already at its normal prompt is a harmless no-op, so
-  # send two rather than trying to detect exactly which screen is showing.
+  # The trust prompt has to be answered before anything else: its default
+  # button is "No, exit", so the blind Enters below would kill claude and
+  # the supervisor would respawn it into the same screen forever.
+  answer_trust_prompt "$name"
+
+  # On a genuinely first-ever run, claude can show an onboarding screen that
+  # needs Enter to accept the default before it reaches the normal prompt —
+  # observed needing two Enters, not one. An extra Enter once claude is
+  # already at its normal prompt is a harmless no-op, so send two rather
+  # than trying to detect exactly which screen is showing.
   sleep 2
-  tmux_cmd send-keys -t "$name" Enter
+  tmux_cmd send-keys -t "=$name:" Enter
   sleep 1
-  tmux_cmd send-keys -t "$name" Enter
+  tmux_cmd send-keys -t "=$name:" Enter
 
   # Best-effort: record the remote-control URL right away so `new` can print
   # it immediately instead of waiting for the first periodic check (up to
@@ -481,7 +773,7 @@ create_session() {
   # one that exits slightly later leaves a dead pane behind.
   if [ "$resumed" -eq 1 ] && { ! session_exists "$name" || pane_is_dead "$name"; }; then
     log "warning: claude exited immediately with '$extra_args' — starting a new conversation instead"
-    tmux_cmd kill-session -t "$name" 2>/dev/null
+    tmux_cmd kill-session -t "=$name" 2>/dev/null
     create_session "$name" 1
     return
   fi
@@ -492,7 +784,7 @@ create_session() {
 respawn_pane() {
   local name="$1"
   log "claude exited (Ctrl+C, crash, or manual exit) — respawning automatically"
-  tmux_cmd respawn-pane -k -t "$name"
+  tmux_cmd respawn-pane -k -t "=$name:"
 }
 
 # auto permission mode falls back to an interactive confirmation after
@@ -506,16 +798,16 @@ respawn_pane() {
 nudge_enter() {
   local name="$1"
   log "no attached client for ${UNATTENDED_NUDGE_SEC}s+ — sending Enter (x2) in case a prompt is stuck waiting for confirmation"
-  tmux_cmd send-keys -t "$name" Enter
+  tmux_cmd send-keys -t "=$name:" Enter
   sleep 1
-  tmux_cmd send-keys -t "$name" Enter
+  tmux_cmd send-keys -t "=$name:" Enter
 }
 
 # PID of an instance's claude process. create_session execs claude as the
 # pane command itself, so the pane PID is claude's own PID, which is also
 # what its file in $CLAUDE_SESSIONS_DIR is named after.
 instance_pid() {
-  tmux_cmd list-panes -t "$1" -F '#{pane_pid}' 2>/dev/null | head -n1
+  tmux_cmd list-panes -t "=$1:" -F '#{pane_pid}' 2>/dev/null | head -n1
 }
 
 # Reads the Remote Control session id out of claude's own session file.
@@ -621,10 +913,10 @@ capture_remote_control_url() {
   # this session" / "Show QR code" / "Continue"; Escape closes that dialog
   # without selecting anything, so this is safe in both states.
   log "remote control not connected for '$name' — sending /remote-control to (re)connect"
-  tmux_cmd send-keys -t "$name" C-u
-  tmux_cmd send-keys -t "$name" "/remote-control" Enter
+  tmux_cmd send-keys -t "=$name:" C-u
+  tmux_cmd send-keys -t "=$name:" "/remote-control" Enter
   sleep 3
-  tmux_cmd send-keys -t "$name" Escape
+  tmux_cmd send-keys -t "=$name:" Escape
 
   if url=$(bridge_url_of "$name"); then
     store_remote_url "$name" "$url"
@@ -638,7 +930,7 @@ capture_remote_control_url() {
   # instance's URL echoed by some command, a session URL in a commit message
   # — cannot be mistaken for this session's own. That confusion is not
   # hypothetical; see DECISIONS.md.
-  url=$(tmux_cmd capture-pane -p -t "$name" 2>/dev/null \
+  url=$(tmux_cmd capture-pane -p -t "=$name:" 2>/dev/null \
     | grep -A2 -E '/remote-control is active|This session is available' \
     | grep -oE 'https://claude\.ai/code/session_[A-Za-z0-9_-]+' | tail -n1)
   if [ -n "$url" ]; then
@@ -795,109 +1087,109 @@ write_default_config() {
     return
   fi
   install -d -m 0755 "$(dirname "$CONFIG_FILE")"
-  cat > "$CONFIG_FILE" <<'EOF'
+  # Unquoted heredoc, unlike every other template here: the values decided
+  # at install time (RUN_AS_USER, and the CLAUDE_ARGS that depend on it)
+  # have to be baked in. Leaving them to the built-in defaults would let a
+  # later version change them underneath a live host.
+  cat > "$CONFIG_FILE" <<EOF
 # claude-guardian runtime configuration — shared defaults for every
 # instance. Per-instance overrides (WORKDIR, CLAUDE_ARGS, CLAUDE_BIN) live
-# in /etc/claude-guardian/instances/<name>.env instead — see `new --help`
-# in README.md. Edit values here, then restart the affected instance(s),
-# e.g.: systemctl restart 'claude-guardian@*'
+# in $INSTANCES_DIR/<name>.env.
+# Edit values here, then restart the instances:
+#   systemctl restart 'claude-guardian@*'
+
+# The account the tmux server, every claude process and the supervision
+# loop run as. Admin commands still need root — this is only who the
+# session itself belongs to. Changing it means re-running
+# '$PROG_NAME install' (the systemd unit carries User=) and giving the new
+# account its own claude login: conversations live under that account's
+# ~/.claude and do not follow it across accounts.
+RUN_AS_USER="$RUN_AS_USER"
 
 # tmux server socket path (kept off the default /tmp socket on purpose).
-# Shared by every instance: one tmux server, many sessions.
-TMUX_SOCKET="/run/claude-guardian/tmux.sock"
+# Created by systemd as RuntimeDirectory=, owned by \$RUN_AS_USER.
+TMUX_SOCKET="$TMUX_SOCKET"
 
-# working directory claude starts in, for any instance that doesn't
-# override it with `new --workdir`
-WORKDIR="/root"
+# working directory claude starts in. Empty = \$RUN_AS_USER's home.
+WORKDIR="$WORKDIR"
 
-# claude executable; override with an absolute path if it is not on
-# systemd's PATH (check with `command -v claude` as root)
-CLAUDE_BIN="claude"
+# claude executable. Resolved at install time as \$RUN_AS_USER, because
+# that is the account that has to be able to run it — systemd's PATH is
+# minimal and usually does not include ~/.local/bin.
+CLAUDE_BIN="$CLAUDE_BIN"
 
-# extra arguments passed to claude on every (re)start, for any instance
-# that doesn't override it with `new --args`.
-# --permission-mode auto: use the auto-mode classifier instead of manual
-#   per-action approval (still safer than --dangerously-skip-permissions).
+# extra arguments passed to claude on every (re)start.
+# --dangerously-skip-permissions: never stop to ask. claude refuses this
+#   flag when it runs as root, so it requires \$RUN_AS_USER to be a
+#   non-root account; the root-safe alternative is
+#   "$DEFAULT_CLAUDE_ARGS_ROOT".
 # --remote-control: prints a claude.ai/code/... URL you can control the
 #   session from on the web or phone, independent of SSH.
-CLAUDE_ARGS="--permission-mode auto --remote-control"
+CLAUDE_ARGS="$CLAUDE_ARGS"
 
 # seconds between liveness checks
-CHECK_INTERVAL_SEC="5"
+CHECK_INTERVAL_SEC="$CHECK_INTERVAL_SEC"
 
-# space-separated apt package names auto-installed if missing
-REQUIRED_APT_PKGS="tmux uuid-runtime"
+# space-separated apt package names auto-installed if missing (root only)
+REQUIRED_APT_PKGS="$REQUIRED_APT_PKGS"
 
-# when no tmux client is attached and claude has been parked on a
-# confirmation dialog for this many seconds, send a bare Enter to clear it.
-# Enter accepts whatever the dialog has highlighted, so this answers a
-# permission prompt for you — including one you opened yourself from
-# claude.ai and simply have not answered yet, which no tmux client can show.
-# Off by default. Set a number of seconds only if you would rather have an
-# abandoned session unstick itself than keep that decision.
-UNATTENDED_NUDGE_SEC="0"
+# when nobody is attached (no tmux client) this many seconds, send a bare
+# Enter to clear a confirmation prompt. 0 disables — the default, because
+# Enter answers whatever the dialog has highlighted on your behalf.
+UNATTENDED_NUDGE_SEC="$UNATTENDED_NUDGE_SEC"
 
 # how often to check that Remote Control is still connected, reconnecting it
-# and picking up the new claude.ai URL if it has dropped (see
-# `claude-guardian url <name>`). The check reads claude's own session file
-# and types nothing into the session, so checking every tick is cheap; it is
-# what keeps an instance continuously reachable. 0 disables.
-REMOTE_CONTROL_CHECK_SEC="5"
+# and picking up the new claude.ai URL if it has dropped. Passive: reads
+# claude's own session file, types nothing. 0 disables.
+REMOTE_CONTROL_CHECK_SEC="$REMOTE_CONTROL_CHECK_SEC"
 
-# minimum seconds between two reconnect attempts for the same instance. Only
-# the reconnect itself types into the session, so this is the knob that keeps
-# an instance that cannot reconnect from being typed into every few seconds.
-REMOTE_CONTROL_RECONNECT_BACKOFF_SEC="60"
+# minimum seconds between two reconnect attempts for the same instance —
+# the reconnect is the part that types /remote-control into the session.
+REMOTE_CONTROL_RECONNECT_BACKOFF_SEC="$REMOTE_CONTROL_RECONNECT_BACKOFF_SEC"
 
-# where Claude Code writes its per-session JSON files, one per running
-# session, named after that session's PID. Read-only; it is what makes the
-# connected/disconnected check above possible, and what tells the nudge
-# whether anyone is actually working in the session. Override only if Claude
-# Code is configured with a non-default CLAUDE_CONFIG_DIR.
-CLAUDE_SESSIONS_DIR="${CLAUDE_CONFIG_DIR:-${HOME:-/root}/.claude}/sessions"
-
-# where Claude Code keeps conversation transcripts. Read-only; used to check
-# that a conversation still exists before trying to resume it.
-CLAUDE_PROJECTS_DIR="${CLAUDE_CONFIG_DIR:-${HOME:-/root}/.claude}/projects"
-
-# 1: after a reboot (or any restart that took the tmux session with it),
-# bring the instance back on the conversation it had before, instead of an
-# empty one. 0: always start a new conversation.
-RESUME_AFTER_RESTART="1"
-
-# `new` refuses once this many instances already exist — each concurrent
+# 'new' refuses once this many instances already exist — each concurrent
 # instance is a separate claude process and a separate token cost.
-# 0 = no limit.
-MAX_SESSIONS="0"
+MAX_SESSIONS="$MAX_SESSIONS"
 
-# 1: at boot, if nothing at all would come up (every instance archived or
-# deactivated), create and start the default instance 'claude-code' from the
-# values above, so this host always boots with one reachable session. It
-# never touches a host that already has an enabled instance. 0: a host left
-# with no enabled instance boots with nothing running, and bringing one back
-# is a manual `claude-guardian new`.
-ENSURE_DEFAULT_INSTANCE="1"
+# 1: after a reboot, bring the instance back on the conversation it had
+# before, instead of an empty one. 0: always start a new conversation.
+RESUME_AFTER_RESTART="$RESUME_AFTER_RESTART"
+
+# 1: at boot, if no instance would come up at all, create and enable the
+# default one. This is the floor that makes "at least one session is always
+# available" a property of the tool rather than a side effect of nobody
+# having archived the last instance. 0: such a host boots with nothing.
+ENSURE_DEFAULT_INSTANCE="$ENSURE_DEFAULT_INSTANCE"
+
+# Where claude keeps its per-session files and its transcripts. Left unset
+# on purpose: both default to \$RUN_AS_USER's ~/.claude, which is where
+# they actually are. Set them only if that account's config dir is
+# somewhere else (\$CLAUDE_CONFIG_DIR).
+#CLAUDE_SESSIONS_DIR=""
+#CLAUDE_PROJECTS_DIR=""
 EOF
-
-  # Resolve claude to an absolute path using *this installer's* environment
-  # (a normal interactive root shell, with a full PATH) rather than leaving
-  # a bare command name in the config. systemd services run with a minimal
-  # default PATH that commonly does NOT include where `claude` actually
-  # lives (e.g. ~/.local/bin) even though it resolves fine interactively —
-  # this caused a real deployment failure (service stuck in `failed`,
-  # preflight's `command -v claude` unable to find it under systemd's PATH)
-  # on a second host during testing. See DECISIONS.md.
-  local resolved
-  resolved=$(command -v "$CLAUDE_BIN" 2>/dev/null || true)
-  if [ -n "$resolved" ]; then
-    sed -i "s|^CLAUDE_BIN=.*|CLAUDE_BIN=\"$resolved\"|" "$CONFIG_FILE"
-  fi
-
-  log "wrote default config to $CONFIG_FILE"
+  chmod 0644 "$CONFIG_FILE"
+  log "wrote default config to $CONFIG_FILE (session account: $RUN_AS_USER)"
 }
 
 write_unit_template() {
-  cat > "$UNIT_TEMPLATE_PATH" <<EOF
+  # systemd creates RuntimeDirectory= before ExecStart and gives it to
+  # User=, which is the only way the socket directory can exist at boot:
+  # /run is a tmpfs, so nothing else has made it yet, and a supervisor that
+  # is no longer root cannot mkdir there itself. Preserve=yes is not
+  # optional — without it systemd deletes the directory, and the live tmux
+  # socket inside it, the moment this unit stops, which is precisely what
+  # KillMode=process exists to prevent. Only emitted for the default
+  # /run/<name> layout; a socket configured anywhere else is created by
+  # ensure_socket_dir on the root side instead.
+  local runtime_dir=""
+  case "$(dirname "$TMUX_SOCKET")" in
+    /run/*/*) ;;
+    /run/?*)  runtime_dir=$(basename "$(dirname "$TMUX_SOCKET")") ;;
+  esac
+
+  {
+    cat <<EOF
 [Unit]
 Description=Claude Code guardian instance '%i' (remotely-attachable claude session)
 After=network-online.target
@@ -910,7 +1202,20 @@ Type=simple
 ExecStart=$INSTALL_BIN run %i
 Restart=always
 RestartSec=5
-User=root
+# The session — tmux server, claude, and this supervision loop — belongs to
+# this account, not to root. Re-run '$PROG_NAME install' after changing
+# RUN_AS_USER in $CONFIG_FILE: 'run' refuses to start when the unit and the
+# config disagree about who owns the session.
+User=$RUN_AS_USER
+EOF
+    if [ -n "$runtime_dir" ]; then
+      cat <<EOF
+RuntimeDirectory=$runtime_dir
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+EOF
+    fi
+    cat <<EOF
 # Only signal the tracked loop PID on stop/restart, not the whole cgroup —
 # the tmux server (and claude inside it) must survive a supervisor restart.
 KillMode=process
@@ -920,7 +1225,8 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-  log "wrote systemd instance template to $UNIT_TEMPLATE_PATH"
+  } > "$UNIT_TEMPLATE_PATH"
+  log "wrote systemd instance template to $UNIT_TEMPLATE_PATH (User=$RUN_AS_USER${runtime_dir:+, RuntimeDirectory=$runtime_dir})"
 }
 
 # A second, non-templated unit whose only job is to run the boot floor once
@@ -940,6 +1246,9 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=$INSTALL_BIN ensure-floor
+# Root, unlike the instance units: the floor writes instance configs under
+# /etc and runs systemctl enable. It never starts claude itself — the
+# instance it enables does that, as \$RUN_AS_USER.
 User=root
 StandardOutput=journal
 StandardError=journal
@@ -978,11 +1287,39 @@ cmd_check() {
 cmd_run() {
   local name="${1:-$DEFAULT_INSTANCE}"
   load_instance "$name"
+  # The unit template carries User=$RUN_AS_USER, so a mismatch here means
+  # the installed unit predates the current config. Starting anyway would
+  # create the tmux server — and everything claude writes — under the wrong
+  # account, locking the session owner out of its own conversation, so this
+  # fails loudly instead.
+  if [ "$(id -un)" != "$RUN_AS_USER" ]; then
+    die "this is running as $(id -un) but RUN_AS_USER=\"$RUN_AS_USER\" ($CONFIG_FILE). Re-run 'sudo $PROG_NAME install' to regenerate the systemd unit, then restart the instance."
+  fi
   preflight_enforce
   supervise_loop "$name"
 }
 
 cmd_install() {
+  require_root
+  # A fresh install adopts the account it was sudo'd from: that is whose
+  # claude login and conversations the operator actually means, and running
+  # the session as root is what makes --dangerously-skip-permissions
+  # impossible. An existing config always wins — install has never
+  # rewritten one (see BACKLOG.md on migrating old configs).
+  if [ ! -e "$CONFIG_FILE" ]; then
+    if [ "$RUN_AS_USER" = "root" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+      RUN_AS_USER="$SUDO_USER"
+      resolve_run_as
+      log "no config yet — the session will run as '$RUN_AS_USER' (the account this sudo came from), workdir $WORKDIR"
+    fi
+    if [ "$RUN_AS_USER" = "root" ]; then
+      # Installed straight as root, with no unprivileged account to adopt.
+      # claude would refuse the shipped default here, so write the
+      # root-safe arguments rather than failing the install.
+      CLAUDE_ARGS="$DEFAULT_CLAUDE_ARGS_ROOT"
+      log "the session will run as root, so CLAUDE_ARGS is \"$CLAUDE_ARGS\" — claude refuses --dangerously-skip-permissions as root. Set RUN_AS_USER to a non-root account in $CONFIG_FILE and re-run install to use it."
+    fi
+  fi
   preflight_enforce
   require_login
   write_default_config
@@ -1000,6 +1337,16 @@ cmd_install() {
   write_unit_template
   write_floor_unit
   systemctl daemon-reload
+
+  # Hand the runtime directories to the session account. This is also the
+  # repair path for a host whose RUN_AS_USER changed: `install` is the one
+  # command whose job is to make the on-disk layout match the config again.
+  ensure_state_dir
+  ensure_socket_dir
+  if [ "$RUN_AS_USER" != "root" ] && [ -d "$STATE_DIR" ]; then
+    chown -R "$RUN_AS_USER:$RUN_AS_GROUP" "$STATE_DIR" 2>/dev/null || true
+    log "$STATE_DIR now belongs to $RUN_AS_USER"
+  fi
 
   if ! instance_exists "$DEFAULT_INSTANCE"; then
     write_instance_file "$DEFAULT_INSTANCE" "$WORKDIR" "$CLAUDE_ARGS" "$CLAUDE_BIN"
@@ -1110,7 +1457,11 @@ cmd_list() {
   local f name active tmux_state attached workdir url
   while IFS= read -r f; do
     name=$(basename "$f" .env)
-    active=$(systemctl is-active "claude-guardian@${name}.service" 2>/dev/null || echo inactive)
+    # is-active prints its answer *and* exits non-zero for anything other
+    # than active, so an '|| echo inactive' fallback printed the word twice
+    # and pushed the rest of the row onto a second line.
+    active=$(systemctl is-active "claude-guardian@${name}.service" 2>/dev/null)
+    [ -n "$active" ] || active="unknown"
     if session_exists "$name"; then
       tmux_state="up"
       attached=$(has_attached_client "$name" && echo yes || echo no)
@@ -1231,8 +1582,8 @@ $prompt"
   install -d -m 0700 "$archive_dir"
 
   if session_exists "$name"; then
-    tmux_cmd capture-pane -pS - -t "$name" > "$archive_dir/scrollback.txt" 2>/dev/null || true
-    tmux_cmd kill-session -t "$name" 2>/dev/null || true
+    tmux_cmd capture-pane -pS - -t "=$name:" > "$archive_dir/scrollback.txt" 2>/dev/null || true
+    tmux_cmd kill-session -t "=$name" 2>/dev/null || true
     log "captured scrollback and killed tmux session '$name'"
   else
     log "no live tmux session for '$name' — archiving config/state only"
@@ -1426,7 +1777,20 @@ cmd_attach() {
   # exec replaces this shell, so it needs a real binary — the tmux_cmd shell
   # function is not on PATH and 'exec tmux_cmd ...' fails with "not found".
   # Inline what tmux_cmd expands to instead.
-  exec tmux -S "$TMUX_SOCKET" attach -t "$name"
+  #
+  # Root may open anyone's socket, so attaching as root to a session owned
+  # by $RUN_AS_USER would work — and would be the wrong thing: tmux would
+  # record a root client on a session whose own processes are not root.
+  # Drop to the session owner instead.
+  if [ "$(id -un)" != "$RUN_AS_USER" ]; then
+    local ru
+    [ "$(id -u)" -eq 0 ] \
+      || die "attach has to run as $RUN_AS_USER or as root (currently $(id -un)) — try 'sudo $PROG_NAME attach $name'"
+    ru=$(runuser_bin) \
+      || die "cannot attach as $RUN_AS_USER: runuser (util-linux) is not installed. Log in as $RUN_AS_USER and run '$PROG_NAME attach $name' there."
+    exec "$ru" -u "$RUN_AS_USER" -- tmux -S "$TMUX_SOCKET" attach -t "=$name"
+  fi
+  exec tmux -S "$TMUX_SOCKET" attach -t "=$name"
 }
 
 cmd_logs() {

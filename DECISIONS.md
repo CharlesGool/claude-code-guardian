@@ -8,6 +8,70 @@ already-rejected option gets recommended again two weeks later.
 
 ---
 
+## 2026-09-12 — the session runs as an unprivileged account, and that is what makes `--dangerously-skip-permissions` possible
+
+- **Context:** the operator asked for the supervised session to run as an
+  ordinary passwordless-`sudo` account instead of root, with
+  `claude --dangerously-skip-permissions`. The two halves are one request:
+  `claude` refuses that flag when it runs as root and exits immediately, so
+  as long as the session was root's, the strongest "never stop to ask"
+  setting available was `--permission-mode auto`. That refusal is the same
+  one recorded on 2026-08-21 as the real v0.7.0 regression — a root instance
+  whose settings asked for `bypassPermissions` crash-looped.
+- **Decision:** add `RUN_AS_USER` (global, default `root`). Root still
+  installs and supervises; the tmux server, `claude`, and the supervision
+  loop run as that account. `install` adopts `$SUDO_USER`. The shipped
+  `CLAUDE_ARGS` default becomes `--dangerously-skip-permissions
+  --remote-control`, except on a root install, which gets
+  `--permission-mode auto --remote-control`. The impossible pairing is
+  refused at the door by `install`, `new` and `run`.
+- **Why global rather than per-instance:** every instance shares one tmux
+  server (2026-08-17), and a tmux server belongs to exactly one account.
+  A per-instance account would require a server per account, which is the
+  design that was already rejected.
+- **Why `passwd` rather than `$HOME`:** an admin command under `sudo` has
+  root's `$HOME`. Every derived path — workdir, `~/.claude/sessions`,
+  `~/.claude/projects` — would have pointed at root's files while the
+  session used another account's. The same reasoning forces `claude`'s
+  location and its login to be resolved through `runuser`, not in the
+  caller's own shell: "is claude logged in?" is a question about an account.
+- **Why the default stays `root`:** an existing host upgrades by re-running
+  `install`, which has never rewritten a config file. Anything else would
+  move a live host's sessions to a different account, and the conversations
+  would not come with them.
+- **What it costs, accepted deliberately:**
+  - Conversations do not follow an account change. `claude` keeps
+    transcripts under the old account's `~/.claude`, unreadable by the new
+    one, and the transcript directory is named after the workdir, which
+    usually changes at the same time. Migration is a documented manual
+    sequence, not something the tool does.
+  - The tool now answers `claude`'s first-run trust prompt (**No, exit** is
+    preselected, so the existing blind Enter would have killed every new
+    session and respawned it into the same screen forever). Answering *yes*
+    for the operator is a decision made on their behalf; the justification
+    is that `$WORKDIR` is a directory they configured for an unattended
+    session. It is coupled to that screen's current wording — a rewording
+    reinstates the respawn loop, and the log would only say `claude exited`.
+  - `--dangerously-skip-permissions` as the shipped default hands the
+    session the account's full privileges, including root on an account with
+    passwordless `sudo`. That is the operator's tradeoff to make, and the
+    root-safe alternative is one config line.
+- **Found while doing it, and fixed in the same release:** every tmux target
+  was a bare session name, and tmux falls back to prefix matching. With
+  `claude-code` and `claude-code-work` both present, commands aimed at the
+  first landed on the second — `send-keys` included, meaning
+  `/remote-control` and bare Enters into a conversation belonging to another
+  instance. Targets are now exact (`=name` for session targets, `=name:` for
+  pane and window targets; both verified against tmux 3.2a). This was
+  reachable before this release, but this release makes it likely, because
+  `install` creates a `claude-code` instance next to whatever is already
+  there.
+- **Also found live:** a socket file outlives the tmux server that made it.
+  After switching accounts, the leftover root-owned socket made every
+  session creation fail with `Permission denied` while the log said only
+  that `claude` had exited. `install` now removes such a socket when no
+  server answers on it, and refuses to touch it when one still does.
+
 ## 2026-08-23 — the unreachable-session failure is understood; it reopens the v0.7.0 withdrawal
 
 - **Context:** the operator reported the long-standing symptom again — a

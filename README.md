@@ -2,11 +2,12 @@
 
 **English** | [简体中文](README.zh.md)
 
-Keeps one or more named, remotely-attachable Claude Code (`claude`) sessions alive on a Debian server, root-managed, surviving both reboots and the `claude` process itself being killed (Ctrl+C, crash, `exit`).
+Keeps one or more named, remotely-attachable Claude Code (`claude`) sessions alive on a Debian server, surviving both reboots and the `claude` process itself being killed (Ctrl+C, crash, `exit`). Root installs and supervises; the sessions themselves run as an ordinary account.
 
 ## What it does
 
-- Installs a systemd **instance template** that supervises one dedicated `tmux` session per named instance, each running `claude --permission-mode auto --remote-control` by default — remote control means you can take any instance over from **claude.ai on the web or your phone**, not just SSH+tmux.
+- Installs a systemd **instance template** that supervises one dedicated `tmux` session per named instance, each running `claude --dangerously-skip-permissions --remote-control` by default — remote control means you can take any instance over from **claude.ai on the web or your phone**, not just SSH+tmux.
+- **The session belongs to an ordinary account, not to root.** `RUN_AS_USER` names the account that owns the tmux server, every `claude` process, and everything `claude` writes; root only installs, supervises, and runs the admin commands. `install` adopts the account you `sudo`'d from. This is not hardening for its own sake: `claude` refuses `--dangerously-skip-permissions` outright when it runs as root, so an unattended session that must never stop to ask for permission *has* to run as somebody else. A host that installs straight as root still works — it gets `--permission-mode auto --remote-control` instead, and the combination "root plus the skip-permissions flag" is refused at the door rather than left to respawn forever.
 - Knows each instance's current `claude.ai/code/...` remote-control URL — `claude-guardian url <name>` or `claude-guardian list` prints it without ever attaching. The point: create, discover, and reach a session entirely from another device, no terminal required. Fetch it when you need it rather than bookmarking it: the URL changes whenever Remote Control reconnects.
 - If `claude` exits for any reason, it is respawned automatically within a few seconds, continuing the same conversation — the tmux session (and its scrollback) survives.
 - If the whole supervisor or the host reboots, every instance that was `activate`d comes back automatically — **on the conversation it was having before**, not an empty one. A reboot takes the tmux server with it, so the session is rebuilt from scratch; the instance's conversation is picked back up with `claude --resume` when its transcript is still on disk (`RESUME_AFTER_RESTART=0` opts out). A conversation that can no longer be resumed falls back to a new one rather than leaving the instance stuck.
@@ -23,9 +24,10 @@ Non-goals: it does not install or update the Claude Code CLI itself, and it does
 ## Requirements
 
 - OS: Debian or a Debian-derivative with systemd (Ubuntu, etc.)
-- Must be run as root
-- `claude` already installed and reachable on `PATH` (or via `CLAUDE_BIN`) — this tool does not install it
-- `claude` already logged in (`claude auth status` must succeed) — `install` refuses to proceed otherwise; run `claude auth login` first
+- Root for every command that writes to `/etc`, `/var/lib` or systemd — `sudo` is enough, and the usual way in is `sudo claude-guardian <command>` from your own account
+- An account for the session to run as (`RUN_AS_USER`). `install` uses the account behind your `sudo`; root is the fallback when there is none. `runuser` (util-linux, normally already present) is what lets root act as it
+- `claude` installed **for that account** and reachable on its `PATH` (or via `CLAUDE_BIN`) — this tool does not install it. The usual `~/.local/bin/claude` is found even when it is not on systemd's `PATH`
+- `claude` already logged in **as that account** (`claude auth status` must succeed there) — `install` refuses to proceed otherwise; run `claude auth login` as that user first. A login belongs to one account: root being logged in says nothing about the session account
 - Internet access for `apt-get` if `tmux` is not already installed
 
 ## Install
@@ -33,14 +35,32 @@ Non-goals: it does not install or update the Claude Code CLI itself, and it does
 ```bash
 # Clone a tag, not the branch tip — the tip can be mid-change.
 # List available tags: git ls-remote --tags <repo-url>
-git clone --depth 1 --branch v0.9.1 https://github.com/CharlesGool/claude-code-guardian.git
+git clone --depth 1 --branch v0.10.0 https://github.com/CharlesGool/claude-code-guardian.git
 cd claude-code-guardian
-bash bin/claude-guardian.sh install
+sudo bash bin/claude-guardian.sh install
 ```
 
-`install` runs the preflight checks, writes a default global config to `/etc/claude-guardian/config.env`, installs the script to `/usr/local/bin/claude-guardian`, writes the systemd **instance template** (`claude-guardian@.service`) and the **boot-floor unit** (`claude-guardian-floor.service`), and creates + enables one default instance named `claude-code`. It does not start it — that's the next step. Upgrading from a v0.1.0 install migrates its single session onto the new template automatically, without killing the live `claude` process.
+Run it with `sudo` from the account the sessions should belong to: `install` records that account (`$SUDO_USER`) as `RUN_AS_USER` and resolves `claude` and its login as that user. It then runs the preflight checks, writes a default global config to `/etc/claude-guardian/config.env`, installs the script to `/usr/local/bin/claude-guardian`, writes the systemd **instance template** (`claude-guardian@.service`, carrying `User=$RUN_AS_USER`) and the **boot-floor unit** (`claude-guardian-floor.service`), hands the state and socket directories to that account, and creates + enables one default instance named `claude-code`. It does not start it — that's the next step. Upgrading from a v0.1.0 install migrates its single session onto the new template automatically, without killing the live `claude` process.
 
-Upgrading from any earlier version: re-run `bash bin/claude-guardian.sh install`. It is idempotent and leaves an existing `config.env` untouched, so the new `ENSURE_DEFAULT_INSTANCE` setting will not appear in your config file — the built-in default (`1`, floor on) applies until you add it yourself. Live instances are not restarted by `install`.
+Upgrading from any earlier version: re-run `sudo bash bin/claude-guardian.sh install`. It is idempotent and leaves an existing `config.env` untouched, so settings added since that file was written — `ENSURE_DEFAULT_INSTANCE`, and now `RUN_AS_USER` — will not appear in it, and their built-in defaults apply until you add them yourself. For `RUN_AS_USER` that default is `root`, so **an upgraded host keeps running its sessions exactly as before**; moving them to an ordinary account is a deliberate, one-way step:
+
+```bash
+# 1. archive every instance (saves scrollback + conversation id, kills the session)
+sudo claude-guardian archive <name> --yes
+# 2. copy the conversations across — they live in the *old* account's ~/.claude
+#    and the new one cannot read them. The directory is named after the workdir,
+#    with every non-alphanumeric character replaced by '-'
+sudo cp /root/.claude/projects/-root/<conversation-id>.jsonl \
+        /home/you/.claude/projects/-home-you/
+sudo chown you:you /home/you/.claude/projects/-home-you/<conversation-id>.jsonl
+# 3. point RUN_AS_USER at the new account and re-install, then recreate the
+#    instances (`resume <archive-id>` continues the conversation; edit the
+#    archive's meta.env first if its workdir was the old account's home)
+sudoedit /etc/claude-guardian/config.env
+sudo claude-guardian install
+```
+
+A live tmux server owned by the old account blocks the new one; `install` says so and stops rather than orphaning its sessions. A socket file merely left behind by a server that is already gone is cleaned up for you. Live instances are not restarted by `install`.
 
 ### Optional: the `claude-session` skill
 
@@ -62,7 +82,7 @@ claude-guardian attach
 That's the default `claude-code` instance. To run a second, independent, concurrently-supervised conversation:
 
 ```bash
-claude-guardian new work --workdir /root/some-project
+claude-guardian new work --workdir /home/you/some-project
 claude-guardian list          # every instance: systemd/tmux state, attached?, workdir, remote-control URL
 claude-guardian url work      # print just the claude.ai URL — no attach needed
 ```
@@ -78,6 +98,8 @@ claude-guardian url work      # print just the claude.ai URL — no attach neede
 - Disconnect Remote Control from inside a session (`/remote-control` → `Disconnect this session`) and detach — within `REMOTE_CONTROL_CHECK_SEC` (5s by default) `claude-guardian logs <name>` shows `remote control disconnected ... reconnecting` followed by a URL, and `claude-guardian url <name>` prints that new URL. While the connection is healthy the log stays silent, which is the point: nothing is typed into a session that does not need it.
 - `reboot` the host — after boot, every instance that was `activate`d is `active` again without manual intervention, and `claude-guardian logs <name>` shows a `continuing this instance's previous conversation` line. Attach: the conversation from before the reboot is still there. (Without a reboot: `claude-guardian stop <name>`, kill its tmux session with `tmux -S /run/claude-guardian/tmux.sock kill-session -t <name>`, then `claude-guardian start <name>` — same result.)
 
+- `bash tests/run-as-user.sh` from a clone — the isolated checks for the session-account layer (who the unit runs as, what the generated config and unit contain, which pairings are refused). It installs nothing, needs no root, and never touches a live session.
+
 ## Configuration
 
 Global defaults live in `/etc/claude-guardian/config.env`. Per-instance overrides (`WORKDIR`, `CLAUDE_ARGS`, `CLAUDE_BIN`) are set at creation time with `new --workdir`/`--args`/`--claude-bin` and live in `/etc/claude-guardian/instances/<name>.env`.
@@ -85,21 +107,22 @@ Global defaults live in `/etc/claude-guardian/config.env`. Per-instance override
 | Variable | Meaning | Default | Scope |
 |---|---|---|---|
 | `TMUX_SOCKET` | shared tmux server socket path | `/run/claude-guardian/tmux.sock` | global |
-| `WORKDIR` | working directory `claude` starts in | `/root` | global / per-instance |
-| `CLAUDE_BIN` | `claude` executable name or absolute path | `claude` | global / per-instance |
-| `CLAUDE_ARGS` | extra CLI args passed on every (re)start | `--permission-mode auto --remote-control` | global / per-instance |
+| `RUN_AS_USER` | the account the tmux server, `claude`, and the supervision loop run as. One per host: every instance shares one tmux server, and a tmux server belongs to exactly one account. Changing it needs a re-`install` (the unit carries `User=`) and a `claude` login for the new account — conversations live in the old account's `~/.claude` and do not follow | the account `install` was `sudo`'d from, else `root` | global |
+| `WORKDIR` | working directory `claude` starts in | `$RUN_AS_USER`'s home | global / per-instance |
+| `CLAUDE_BIN` | `claude` executable name or absolute path, resolved as `$RUN_AS_USER` at install time | `claude` | global / per-instance |
+| `CLAUDE_ARGS` | extra CLI args passed on every (re)start | `--dangerously-skip-permissions --remote-control`, or `--permission-mode auto --remote-control` when the session runs as root | global / per-instance |
 | `CHECK_INTERVAL_SEC` | seconds between liveness checks | `5` | global |
 | `REQUIRED_APT_PKGS` | space-separated apt packages auto-installed if missing | `tmux uuid-runtime` | global |
 | `UNATTENDED_NUDGE_SEC` | unattended-only: send Enter once a confirmation dialog has been unanswered this long, answering it on your behalf. `0` = never (default). Nothing is ever sent to a session that is working or at a prompt | `0` | global |
 | `REMOTE_CONTROL_CHECK_SEC` | unattended-only: seconds between connection checks; the check is passive and types nothing, so this can be as low as the tick interval (`0` disables) | `5` | global |
 | `REMOTE_CONTROL_RECONNECT_BACKOFF_SEC` | minimum seconds between two reconnect attempts — the reconnect is the part that types `/remote-control` into the session | `60` | global |
-| `CLAUDE_SESSIONS_DIR` | where Claude Code writes its per-session JSON files; read-only, and what the connected/disconnected and busy/idle/waiting checks read | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions` | global |
-| `CLAUDE_PROJECTS_DIR` | where Claude Code keeps conversation transcripts; read-only, checked before resuming a conversation after a restart | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects` | global |
+| `CLAUDE_SESSIONS_DIR` | where Claude Code writes its per-session JSON files; read-only, and what the connected/disconnected and busy/idle/waiting checks read | `$RUN_AS_USER`'s `~/.claude/sessions` | global |
+| `CLAUDE_PROJECTS_DIR` | where Claude Code keeps conversation transcripts; read-only, checked before resuming a conversation after a restart | `$RUN_AS_USER`'s `~/.claude/projects` | global |
 | `RESUME_AFTER_RESTART` | `1`: bring an instance back on its previous conversation after a reboot. `0`: always start a new one | `1` | global / per-instance |
 | `MAX_SESSIONS` | `new`/`resume` refuse once this many instances already exist; `0` = no limit | `0` | global |
 | `ENSURE_DEFAULT_INSTANCE` | `1`: at boot, if no instance would come up at all, create and start the default `claude-code` one. Never touches a host that already has an enabled instance. `0`: such a host boots with nothing | `1` | global |
 
-Editing `CLAUDE_ARGS` to remove `--permission-mode auto` changes the safety tradeoff described in `DESIGN.md` → Known limitations — read that first.
+`CLAUDE_ARGS` is where the safety tradeoff lives, and it is tied to `RUN_AS_USER`: `--dangerously-skip-permissions` means the session never stops to ask, and `claude` refuses it as root. `claude-guardian check` reports on that pairing, and `install`/`new`/`run` refuse the impossible combination instead of respawning a session that exits immediately. Read `DESIGN.md` → Known limitations before changing either.
 
 Edit `/etc/claude-guardian/config.env` and `systemctl restart 'claude-guardian@*'` to apply globally, or edit one instance's file and `claude-guardian restart <name>` for just that instance. Full reference: see `DESIGN.md` → Configuration reference.
 
